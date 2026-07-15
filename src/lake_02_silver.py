@@ -1,24 +1,32 @@
+import os
 from pathlib import Path
 
 import duckdb
-import os
 
 
 def normalize_sql_path(path: Path) -> str:
     """
-    Converte o caminho para um formato compatível com o SQL do DuckDB.
+    Converte um caminho do sistema operacional para um formato
+    compatível com strings SQL do DuckDB.
+
+    No Windows:
+    C:\\projeto\\arquivo.parquet
+
+    Torna-se:
+    C:/projeto/arquivo.parquet
     """
     return path.resolve().as_posix().replace("'", "''")
 
 
-def load_silver_data():
+def load_silver_data() -> None:
     project_dir = Path(__file__).resolve().parent.parent
 
-    # O arquivo já é resultado da ingestão Bronze.
+    # Arquivo Parquet produzido pela camada Bronze.
     bronze_path = (
         project_dir
         / "data"
-        / "raw"
+        / "lake"
+        / "01_bronze"
         / "logs_rastreador_2026-07-01.parquet"
     )
 
@@ -61,21 +69,24 @@ def load_silver_data():
     con = duckdb.connect()
 
     try:
-        # ---------------------------------------------------------
-        # View comum da Bronze
-        # ---------------------------------------------------------
+        # =========================================================
+        # VIEW COMUM DA BRONZE
+        # =========================================================
         #
-        # Aqui fazemos somente normalizações comuns:
-        # - nomes das colunas;
-        # - remoção de espaços;
-        # - strings vazias para NULL;
-        # - timestamps com TRY_CAST.
+        # Esta view realiza apenas normalizações compartilhadas:
         #
-        # Os campos BAT_VOLT, LAT e LONT continuam como texto nesta
-        # etapa porque, na mensagem T1, possuem outro significado.
-        # ---------------------------------------------------------
+        # - renomeia as colunas;
+        # - remove espaços;
+        # - converte strings vazias para NULL;
+        # - tenta converter os timestamps;
+        # - mantém os demais campos inicialmente como texto.
+        #
+        # BAT_VOLT, LAT e LONT não são convertidos aqui porque as
+        # mensagens T1 utilizam essas posições para identificadores.
+        # =========================================================
 
-        con.execute(f"""
+        con.execute(
+            f"""
             CREATE OR REPLACE TEMP VIEW bronze_normalized AS
 
             SELECT
@@ -268,15 +279,22 @@ def load_silver_data():
                 '{bronze_sql_path}',
                 filename = TRUE
             )
-        """)
+            """
+        )
 
-        # ---------------------------------------------------------
-        # Silver: Telemetry Events
-        # ---------------------------------------------------------
+        # =========================================================
+        # SILVER: TELEMETRY EVENTS
+        # =========================================================
+        #
+        # Contém as mensagens válidas de telemetria.
+        #
+        # T1 é excluída porque possui outro schema lógico.
+        # =========================================================
 
         print("[Lake] Creating telemetry_events...")
 
-        con.execute(f"""
+        con.execute(
+            f"""
             COPY (
                 WITH typed_telemetry AS (
                     SELECT
@@ -408,15 +426,16 @@ def load_silver_data():
                         '^T[0-9]+$'
                     )
 
-                    -- T1 tem outro schema lógico.
+                    -- T1 contém dados de identidade.
                     AND message_type <> 'T1'
 
-                    -- Um evento precisa ter data e dispositivo.
+                    -- Um evento precisa ter timestamp.
                     AND COALESCE(
                         device_timestamp,
                         server_timestamp
                     ) IS NOT NULL
 
+                    -- Um evento precisa identificar o dispositivo.
                     AND device_serial_raw IS NOT NULL
                 )
 
@@ -462,23 +481,25 @@ def load_silver_data():
                 FORMAT PARQUET,
                 COMPRESSION ZSTD,
                 PARTITION_BY (event_date),
-                OVERWRITE TRUE,
-                PER_THREAD_OUTPUT TRUE
+                OVERWRITE
             )
-        """)
+            """
+        )
 
-        # ---------------------------------------------------------
-        # Silver: Device Identity Events
-        # ---------------------------------------------------------
+        # =========================================================
+        # SILVER: DEVICE IDENTITY EVENTS
+        # =========================================================
         #
-        # Não agrupamos por dispositivo.
-        # A Silver preserva todas as mensagens T1.
-        # A dim_device será criada depois, na Gold.
-        # ---------------------------------------------------------
+        # Contém todas as mensagens T1.
+        #
+        # Não agrupamos por dispositivo nesta camada. A Silver
+        # preserva o histórico dos eventos de identidade.
+        # =========================================================
 
         print("[Lake] Creating device_identity_events...")
 
-        con.execute(f"""
+        con.execute(
+            f"""
             COPY (
                 WITH identity_events AS (
                     SELECT
@@ -587,18 +608,22 @@ def load_silver_data():
                 FORMAT PARQUET,
                 COMPRESSION ZSTD,
                 PARTITION_BY (event_date),
-                OVERWRITE TRUE,
-                PER_THREAD_OUTPUT TRUE
+                OVERWRITE
             )
-        """)
+            """
+        )
 
-        # ---------------------------------------------------------
-        # Silver: Rejected Logs
-        # ---------------------------------------------------------
+        # =========================================================
+        # SILVER: REJECTED LOGS
+        # =========================================================
+        #
+        # Contém linhas que não podem entrar nas tabelas tratadas.
+        # =========================================================
 
         print("[Lake] Creating rejected_logs...")
 
-        con.execute(f"""
+        con.execute(
+            f"""
             COPY (
                 WITH rejected AS (
                     SELECT
@@ -667,9 +692,10 @@ def load_silver_data():
                 FORMAT PARQUET,
                 COMPRESSION ZSTD,
                 PARTITION_BY (rejection_date),
-                OVERWRITE TRUE
+                OVERWRITE
             )
-        """)
+            """
+        )
 
         print("[Lake] Silver layer complete!")
         print(f"[Lake] Telemetry: {telemetry_path}")
