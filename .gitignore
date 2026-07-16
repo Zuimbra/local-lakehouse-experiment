@@ -1,0 +1,83 @@
+# ==========================================
+# Python
+# ==========================================
+
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Ambientes virtuais
+.venv/
+venv/
+env/
+ENV/
+
+# Cache de ferramentas
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Build e empacotamento
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# ==========================================
+# Variáveis de ambiente e arquivos locais
+# ==========================================
+
+.env
+.env.*
+!.env.example
+
+# ==========================================
+# Jupyter
+# ==========================================
+
+.ipynb_checkpoints/
+
+# ==========================================
+# IDEs e editores
+# ==========================================
+
+.vscode/
+.idea/
+*.code-workspace
+
+# ==========================================
+# Sistemas operacionais
+# ==========================================
+
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ==========================================
+# Bancos locais
+# ==========================================
+
+*.duckdb
+*.duckdb.wal
+*.db
+*.sqlite
+*.sqlite3
+
+# ==========================================
+# Dados brutos locais
+# ==========================================
+
+data/raw/**/*
+!data/raw/**/
+!data/raw/**/.gitkeep
+!data/raw/sample_logs_rastreador.csv
+
+# ==========================================
+# Saídas geradas pelo pipeline
+# ==========================================
+
+data/lake/**/*
+!data/lake/**/
+!data/lake/**/.gitkeep
