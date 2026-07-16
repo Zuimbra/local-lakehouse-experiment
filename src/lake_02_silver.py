@@ -1,39 +1,25 @@
-import os
 from pathlib import Path
 
 import duckdb
-
-
-def normalize_sql_path(path: Path) -> str:
-    """
-    Converte um caminho do sistema operacional para um formato
-    compatível com strings SQL do DuckDB.
-
-    No Windows:
-    C:\\projeto\\arquivo.parquet
-
-    Torna-se:
-    C:/projeto/arquivo.parquet
-    """
-    return path.resolve().as_posix().replace("'", "''")
+from deltalake import DeltaTable, write_deltalake
 
 
 def load_silver_data() -> None:
     project_dir = Path(__file__).resolve().parent.parent
 
-    # Arquivo Parquet produzido pela camada Bronze.
+    # Diretório da Delta Table produzido pela camada Bronze.
     bronze_path = (
         project_dir
         / "data"
-        / "lake"
+        / "lakehouse"
         / "01_bronze"
-        / "logs_rastreador_2026-07-01.parquet"
+        / "logs_rastreador_2026-07-01"
     )
 
     silver_path = (
         project_dir
         / "data"
-        / "lake"
+        / "lakehouse"
         / "02_silver"
     )
 
@@ -52,23 +38,34 @@ def load_silver_data() -> None:
         / "rejected_logs"
     )
 
-    os.makedirs(silver_path, exist_ok=True)
+    silver_path.mkdir(parents=True, exist_ok=True)
 
-    if not bronze_path.is_file():
+    if not bronze_path.is_dir():
         raise FileNotFoundError(
-            f"The Bronze file does not exist: {bronze_path}"
+            f"The Bronze Delta Table does not exist: {bronze_path}"
         )
 
-    bronze_sql_path = normalize_sql_path(bronze_path)
-    telemetry_sql_path = normalize_sql_path(telemetry_path)
-    identity_sql_path = normalize_sql_path(identity_path)
-    rejected_sql_path = normalize_sql_path(rejected_path)
+    if not (bronze_path / "_delta_log").is_dir():
+        raise ValueError(
+            f"The Bronze path is not a valid Delta Table: {bronze_path}"
+        )
 
-    print("[Lake] Reading from Bronze Parquet...")
+    print("[Lakehouse] Reading from Bronze Delta Table...")
 
     con = duckdb.connect()
 
     try:
+        bronze_table = DeltaTable(str(bronze_path))
+        con.register(
+            "bronze",
+            bronze_table.to_pyarrow_dataset(),
+        )
+
+        # A Bronze atual não possui uma coluna source_file.
+        # Preservamos a informação usando o nome lógico da origem.
+        source_file_name = f"{bronze_path.name}.csv"
+        source_file_sql = source_file_name.replace("'", "''")
+
         # =========================================================
         # VIEW COMUM DA BRONZE
         # =========================================================
@@ -273,12 +270,9 @@ def load_silver_data() -> None:
                     ''
                 ) AS temperature_4_raw,
 
-                filename AS source_file
+                '{source_file_sql}' AS source_file
 
-            FROM read_parquet(
-                '{bronze_sql_path}',
-                filename = TRUE
-            )
+            FROM bronze
             """
         )
 
@@ -291,11 +285,10 @@ def load_silver_data() -> None:
         # T1 é excluída porque possui outro schema lógico.
         # =========================================================
 
-        print("[Lake] Creating telemetry_events...")
+        print("[Lakehouse] Creating telemetry_events...")
 
-        con.execute(
+        df_telemetry = con.execute(
             f"""
-            COPY (
                 WITH typed_telemetry AS (
                     SELECT
                         server_timestamp,
@@ -475,15 +468,14 @@ def load_silver_data() -> None:
                     END AS position_quality
 
                 FROM typed_telemetry
-            )
-            TO '{telemetry_sql_path}'
-            (
-                FORMAT PARQUET,
-                COMPRESSION ZSTD,
-                PARTITION_BY (event_date),
-                OVERWRITE
-            )
             """
+        ).df()
+
+        write_deltalake(
+            telemetry_path,
+            df_telemetry,
+            mode="overwrite",
+            partition_by=["event_date"],
         )
 
         # =========================================================
@@ -496,11 +488,10 @@ def load_silver_data() -> None:
         # preserva o histórico dos eventos de identidade.
         # =========================================================
 
-        print("[Lake] Creating device_identity_events...")
+        print("[Lakehouse] Creating device_identity_events...")
 
-        con.execute(
+        df_identity = con.execute(
             f"""
-            COPY (
                 WITH identity_events AS (
                     SELECT
                         server_timestamp,
@@ -602,15 +593,14 @@ def load_silver_data() -> None:
                     END AS has_valid_imei_format
 
                 FROM identity_events
-            )
-            TO '{identity_sql_path}'
-            (
-                FORMAT PARQUET,
-                COMPRESSION ZSTD,
-                PARTITION_BY (event_date),
-                OVERWRITE
-            )
             """
+        ).df()
+
+        write_deltalake(
+            identity_path,
+            df_identity,
+            mode="overwrite",
+            partition_by=["event_date"],
         )
 
         # =========================================================
@@ -620,11 +610,10 @@ def load_silver_data() -> None:
         # Contém linhas que não podem entrar nas tabelas tratadas.
         # =========================================================
 
-        print("[Lake] Creating rejected_logs...")
+        print("[Lakehouse] Creating rejected_logs...")
 
-        con.execute(
+        df_rejected = con.execute(
             f"""
-            COPY (
                 WITH rejected AS (
                     SELECT
                         COALESCE(
@@ -686,25 +675,24 @@ def load_silver_data() -> None:
                     rejected.*
 
                 FROM rejected
-            )
-            TO '{rejected_sql_path}'
-            (
-                FORMAT PARQUET,
-                COMPRESSION ZSTD,
-                PARTITION_BY (rejection_date),
-                OVERWRITE
-            )
             """
+        ).df()
+
+        write_deltalake(
+            rejected_path,
+            df_rejected,
+            mode="overwrite",
+            partition_by=["rejection_date"],
         )
 
-        print("[Lake] Silver layer complete!")
-        print(f"[Lake] Telemetry: {telemetry_path}")
-        print(f"[Lake] Identity: {identity_path}")
-        print(f"[Lake] Rejected: {rejected_path}")
+        print("[Lakehouse] Silver layer complete!")
+        print(f"[Lakehouse] Telemetry: {telemetry_path}")
+        print(f"[Lakehouse] Identity: {identity_path}")
+        print(f"[Lakehouse] Rejected: {rejected_path}")
 
-    except duckdb.Error as error:
+    except Exception as error:
         raise RuntimeError(
-            f"DuckDB error while creating Silver data: {error}"
+            f"Error while creating Silver Delta Tables: {error}"
         ) from error
 
     finally:
