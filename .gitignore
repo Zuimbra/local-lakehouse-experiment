@@ -86,6 +86,6 @@ data/lake/**/*
 # Saídas geradas pelo Lakehouse
 # ==========================================
 
-data/lakehouse/01_bronze/
-data/lakehouse/02_silver/
-data/lakehouse/03_gold/
+data/lakehouse/**/*
+!data/lakehouse/**/
+!data/lakehouse/**/.gitkeep
