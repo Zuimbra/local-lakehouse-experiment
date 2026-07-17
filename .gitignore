@@ -75,9 +75,17 @@ data/raw/**/*
 !data/raw/sample_logs_rastreador.csv
 
 # ==========================================
-# Saídas geradas pelo pipeline
+# Saídas geradas pelo Lake
 # ==========================================
 
 data/lake/**/*
 !data/lake/**/
 !data/lake/**/.gitkeep
+
+# ==========================================
+# Saídas geradas pelo Lakehouse
+# ==========================================
+
+data/lakehouse/01_bronze/
+data/lakehouse/02_silver/
+data/lakehouse/03_gold/
