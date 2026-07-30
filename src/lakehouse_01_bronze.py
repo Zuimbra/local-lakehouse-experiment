@@ -25,6 +25,15 @@ METADATA_COLUMNS = (
 
 FILE_HASH_CHUNK_SIZE = 1024 * 1024
 
+CONTROL_STATUSES = (
+    "PROCESSING",
+    "SUCCESS",
+    "FAILED",
+    "SKIPPED",
+)
+
+CONTROL_STAGE = "BRONZE"
+
 # A Silver atual referencia diretamente todas essas colunas.
 # Colunas adicionais são permitidas, mas nenhuma destas pode faltar.
 EXPECTED_COLUMNS = (
@@ -82,6 +91,31 @@ class FileValidationResult:
     reserved_columns: tuple[str, ...] = ()
     error_message: str | None = None
     detected_encoding: str | None = None
+
+
+@dataclass(frozen=True)
+class IngestionControlEvent:
+    """
+    Evento imutável do histórico de ingestão de um arquivo.
+
+    A tabela de controle é append-only: cada mudança de estado gera
+    uma nova linha, preservando o histórico da tentativa.
+    """
+
+    control_event_id: str
+    batch_id: str
+    source_file: str
+    source_file_hash: str | None
+    status: str
+    stage: str
+    started_at: datetime
+    finished_at: datetime | None
+    row_count: int | None
+    inserted_row_count: int | None
+    duplicate_row_count: int | None
+    status_reason: str | None
+    error_message: str | None
+    recorded_at: datetime
 
 
 def create_raw_directories(
@@ -431,119 +465,6 @@ def move_file_to_quarantine(
     return destination
 
 
-def validate_discovered_files(
-    input_files: list[Path],
-    quarantine_path: Path,
-) -> list[FileValidationResult]:
-    """
-    Valida cada arquivo isoladamente.
-
-    Uma falha não interrompe a validação dos outros arquivos.
-    """
-    results: list[FileValidationResult] = []
-
-    for file_path in input_files:
-        print(
-            "[Lakehouse][Bronze][Validation] "
-            f"Validando: {file_path.name}"
-        )
-
-        result = validate_input_file(file_path)
-        results.append(result)
-
-        if result.is_valid:
-            print(
-                "[Lakehouse][Bronze][Validation] "
-                f"VALID | arquivo={file_path.name} "
-                f"| linhas={result.row_count} "
-                f"| encoding={result.detected_encoding}"
-            )
-            continue
-
-        print(
-            "[Lakehouse][Bronze][Validation] "
-            f"INVALID | arquivo={file_path.name} "
-            f"| motivo={result.error_message}"
-        )
-
-        if result.missing_columns:
-            print(
-                "[Lakehouse][Bronze][Validation] "
-                "Colunas ausentes: "
-                + ", ".join(result.missing_columns)
-            )
-
-        if result.reserved_columns:
-            print(
-                "[Lakehouse][Bronze][Validation] "
-                "Colunas reservadas encontradas: "
-                + ", ".join(result.reserved_columns)
-            )
-
-        quarantined_file = move_file_to_quarantine(
-            validation_result=result,
-            quarantine_path=quarantine_path,
-        )
-
-        print(
-            "[Lakehouse][Bronze][Quarantine] "
-            f"Movido para: {quarantined_file}"
-        )
-
-    return results
-
-
-def find_valid_legacy_source(
-    validation_results: list[FileValidationResult],
-) -> FileValidationResult | None:
-    """
-    Localiza o arquivo que continua alimentando a Bronze atual.
-    """
-    for result in validation_results:
-        if (
-            result.is_valid
-            and result.source_path.name == LEGACY_SOURCE_FILE
-        ):
-            return result
-
-    return None
-
-
-def validate_legacy_root_file(
-    raw_path: Path,
-    quarantine_path: Path,
-) -> FileValidationResult | None:
-    """
-    Compatibilidade temporária com o CSV no antigo data/raw/.
-
-    Novos arquivos devem ser colocados em data/raw/inbox/.
-    """
-    legacy_path = raw_path / LEGACY_SOURCE_FILE
-
-    if not legacy_path.is_file():
-        return None
-
-    print(
-        "[Lakehouse][Bronze][WARNING] "
-        f"O arquivo {LEGACY_SOURCE_FILE} ainda está em data/raw/. "
-        "Mova-o para data/raw/inbox/."
-    )
-
-    result = validate_input_file(legacy_path)
-
-    if not result.is_valid:
-        quarantined_file = move_file_to_quarantine(
-            validation_result=result,
-            quarantine_path=quarantine_path,
-        )
-        print(
-            "[Lakehouse][Bronze][Quarantine] "
-            f"Arquivo antigo inválido movido para: {quarantined_file}"
-        )
-
-    return result
-
-
 def calculate_file_hash(
     file_path: Path,
     chunk_size: int = FILE_HASH_CHUNK_SIZE,
@@ -734,6 +655,515 @@ def write_current_bronze_table(
     return bronze_path
 
 
+def get_control_table_path(
+    project_dir: Path,
+) -> Path:
+    """
+    Retorna o caminho da Delta Table de controle de ingestão.
+    """
+    return (
+        project_dir
+        / "data"
+        / "lakehouse"
+        / "00_control"
+        / "ingestion_files"
+    )
+
+
+def is_delta_table(table_path: Path) -> bool:
+    """
+    Verifica se o caminho já contém o log transacional Delta.
+    """
+    return (
+        table_path.is_dir()
+        and (table_path / "_delta_log").is_dir()
+    )
+
+
+def create_control_event(
+    *,
+    batch_id: str,
+    source_file: str,
+    source_file_hash: str | None,
+    status: str,
+    started_at: datetime,
+    finished_at: datetime | None = None,
+    row_count: int | None = None,
+    inserted_row_count: int | None = None,
+    duplicate_row_count: int | None = None,
+    status_reason: str | None = None,
+    error_message: str | None = None,
+    recorded_at: datetime | None = None,
+) -> IngestionControlEvent:
+    """
+    Cria e valida um evento da tabela de controle.
+    """
+    normalized_status = status.strip().upper()
+
+    if normalized_status not in CONTROL_STATUSES:
+        raise ValueError(
+            "Status de controle inválido: "
+            f"{status}. Esperado: {CONTROL_STATUSES}."
+        )
+
+    if not batch_id.strip():
+        raise ValueError("batch_id não pode ser vazio.")
+
+    if not source_file.strip():
+        raise ValueError("source_file não pode ser vazio.")
+
+    for field_name, value in (
+        ("row_count", row_count),
+        ("inserted_row_count", inserted_row_count),
+        ("duplicate_row_count", duplicate_row_count),
+    ):
+        if value is not None and value < 0:
+            raise ValueError(
+                f"{field_name} não pode ser negativo."
+            )
+
+    normalized_started_at = normalize_ingestion_timestamp(
+        started_at
+    )
+    normalized_recorded_at = normalize_ingestion_timestamp(
+        recorded_at
+    )
+    normalized_finished_at = (
+        normalize_ingestion_timestamp(finished_at)
+        if finished_at is not None
+        else None
+    )
+
+    if (
+        normalized_finished_at is not None
+        and normalized_finished_at < normalized_started_at
+    ):
+        raise ValueError(
+            "finished_at não pode ser anterior a started_at."
+        )
+
+    if (
+        normalized_status != "PROCESSING"
+        and normalized_finished_at is None
+    ):
+        normalized_finished_at = normalized_recorded_at
+
+    return IngestionControlEvent(
+        control_event_id=str(uuid4()),
+        batch_id=batch_id,
+        source_file=source_file,
+        source_file_hash=source_file_hash,
+        status=normalized_status,
+        stage=CONTROL_STAGE,
+        started_at=normalized_started_at,
+        finished_at=normalized_finished_at,
+        row_count=row_count,
+        inserted_row_count=inserted_row_count,
+        duplicate_row_count=duplicate_row_count,
+        status_reason=status_reason,
+        error_message=error_message,
+        recorded_at=normalized_recorded_at,
+    )
+
+
+def control_event_to_arrow_table(
+    event: IngestionControlEvent,
+):
+    """
+    Converte o evento para uma PyArrow Table com schema explícito.
+
+    O schema explícito evita que campos inicialmente nulos sejam
+    persistidos como NullType e causem erro em eventos posteriores.
+    """
+    import pyarrow as pa
+
+    schema = pa.schema(
+        [
+            pa.field("control_event_id", pa.string(), nullable=False),
+            pa.field("batch_id", pa.string(), nullable=False),
+            pa.field("source_file", pa.string(), nullable=False),
+            pa.field("source_file_hash", pa.string(), nullable=True),
+            pa.field("status", pa.string(), nullable=False),
+            pa.field("stage", pa.string(), nullable=False),
+            pa.field(
+                "started_at",
+                pa.timestamp("us", tz="UTC"),
+                nullable=False,
+            ),
+            pa.field(
+                "finished_at",
+                pa.timestamp("us", tz="UTC"),
+                nullable=True,
+            ),
+            pa.field("row_count", pa.int64(), nullable=True),
+            pa.field(
+                "inserted_row_count",
+                pa.int64(),
+                nullable=True,
+            ),
+            pa.field(
+                "duplicate_row_count",
+                pa.int64(),
+                nullable=True,
+            ),
+            pa.field("status_reason", pa.string(), nullable=True),
+            pa.field("error_message", pa.string(), nullable=True),
+            pa.field(
+                "recorded_at",
+                pa.timestamp("us", tz="UTC"),
+                nullable=False,
+            ),
+        ]
+    )
+
+    return pa.Table.from_pylist(
+        [
+            {
+                "control_event_id": event.control_event_id,
+                "batch_id": event.batch_id,
+                "source_file": event.source_file,
+                "source_file_hash": event.source_file_hash,
+                "status": event.status,
+                "stage": event.stage,
+                "started_at": event.started_at,
+                "finished_at": event.finished_at,
+                "row_count": event.row_count,
+                "inserted_row_count": event.inserted_row_count,
+                "duplicate_row_count": event.duplicate_row_count,
+                "status_reason": event.status_reason,
+                "error_message": event.error_message,
+                "recorded_at": event.recorded_at,
+            }
+        ],
+        schema=schema,
+    )
+
+
+def append_control_event(
+    control_path: Path,
+    event: IngestionControlEvent,
+) -> None:
+    """
+    Acrescenta um evento à tabela de controle.
+    """
+    from deltalake import write_deltalake
+
+    control_path.parent.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    write_mode = (
+        "append"
+        if is_delta_table(control_path)
+        else "overwrite"
+    )
+
+    write_deltalake(
+        control_path,
+        control_event_to_arrow_table(event),
+        mode=write_mode,
+    )
+
+
+def record_ingestion_status(
+    control_path: Path,
+    *,
+    batch_id: str,
+    source_file: str,
+    source_file_hash: str | None,
+    status: str,
+    started_at: datetime,
+    finished_at: datetime | None = None,
+    row_count: int | None = None,
+    inserted_row_count: int | None = None,
+    duplicate_row_count: int | None = None,
+    status_reason: str | None = None,
+    error_message: str | None = None,
+) -> IngestionControlEvent:
+    """
+    Cria, persiste e exibe um evento de controle.
+    """
+    event = create_control_event(
+        batch_id=batch_id,
+        source_file=source_file,
+        source_file_hash=source_file_hash,
+        status=status,
+        started_at=started_at,
+        finished_at=finished_at,
+        row_count=row_count,
+        inserted_row_count=inserted_row_count,
+        duplicate_row_count=duplicate_row_count,
+        status_reason=status_reason,
+        error_message=error_message,
+    )
+
+    append_control_event(
+        control_path=control_path,
+        event=event,
+    )
+
+    print(
+        "[Lakehouse][Control] "
+        f"status={event.status} "
+        f"| arquivo={event.source_file} "
+        f"| batch={event.batch_id}"
+    )
+
+    return event
+
+
+def load_successful_file_hashes(
+    control_path: Path,
+) -> set[str]:
+    """
+    Carrega os hashes que já tiveram pelo menos um evento SUCCESS.
+
+    PROCESSING, FAILED e SKIPPED não bloqueiam uma nova tentativa.
+    """
+    if not is_delta_table(control_path):
+        return set()
+
+    from deltalake import DeltaTable
+
+    control_dataframe = DeltaTable(
+        str(control_path)
+    ).to_pandas(
+        columns=["source_file_hash", "status"]
+    )
+
+    if control_dataframe.empty:
+        return set()
+
+    successful_rows = control_dataframe.loc[
+        control_dataframe["status"] == "SUCCESS",
+        "source_file_hash",
+    ].dropna()
+
+    return {
+        str(file_hash)
+        for file_hash in successful_rows.tolist()
+        if str(file_hash).strip()
+    }
+
+
+def should_skip_file_hash(
+    source_file_hash: str,
+    successful_file_hashes: set[str],
+) -> bool:
+    """
+    Decide se o conteúdo do arquivo já foi concluído com sucesso.
+    """
+    return source_file_hash in successful_file_hashes
+
+
+def add_legacy_root_file_if_needed(
+    input_files: list[Path],
+    raw_path: Path,
+) -> list[Path]:
+    """
+    Mantém compatibilidade temporária com o arquivo em data/raw/.
+
+    Se houver um arquivo de mesmo nome na inbox, a inbox tem prioridade.
+    """
+    legacy_path = raw_path / LEGACY_SOURCE_FILE
+
+    if not legacy_path.is_file():
+        return input_files
+
+    if any(
+        file_path.name == LEGACY_SOURCE_FILE
+        for file_path in input_files
+    ):
+        return input_files
+
+    print(
+        "[Lakehouse][Bronze][WARNING] "
+        f"O arquivo {LEGACY_SOURCE_FILE} ainda está em data/raw/. "
+        "Mova-o para data/raw/inbox/."
+    )
+
+    return sorted(
+        [*input_files, legacy_path],
+        key=lambda file_path: file_path.name.lower(),
+    )
+
+
+def process_input_files_with_control(
+    *,
+    project_dir: Path,
+    input_files: list[Path],
+    quarantine_path: Path,
+    control_path: Path,
+    batch_id: str,
+    successful_file_hashes: set[str],
+) -> list[FileValidationResult]:
+    """
+    Controla e processa cada arquivo de forma isolada.
+
+    Nesta sprint, apenas o arquivo legado é escrito na Bronze. Outros
+    arquivos válidos recebem SKIPPED e permanecem na inbox para a futura
+    ativação do processamento múltiplo.
+    """
+    validation_results: list[FileValidationResult] = []
+
+    for file_path in input_files:
+        started_at = datetime.now(timezone.utc)
+
+        try:
+            source_file_hash = calculate_file_hash(file_path)
+        except Exception as error:
+            record_ingestion_status(
+                control_path,
+                batch_id=batch_id,
+                source_file=file_path.name,
+                source_file_hash=None,
+                status="FAILED",
+                started_at=started_at,
+                finished_at=datetime.now(timezone.utc),
+                error_message=(
+                    "Não foi possível calcular o hash do arquivo: "
+                    f"{error}"
+                ),
+            )
+            continue
+
+        if should_skip_file_hash(
+            source_file_hash,
+            successful_file_hashes,
+        ):
+            record_ingestion_status(
+                control_path,
+                batch_id=batch_id,
+                source_file=file_path.name,
+                source_file_hash=source_file_hash,
+                status="SKIPPED",
+                started_at=started_at,
+                finished_at=datetime.now(timezone.utc),
+                inserted_row_count=0,
+                duplicate_row_count=0,
+                status_reason=(
+                    "O mesmo conteúdo já possui uma ingestão "
+                    "concluída com SUCCESS."
+                ),
+            )
+            continue
+
+        record_ingestion_status(
+            control_path,
+            batch_id=batch_id,
+            source_file=file_path.name,
+            source_file_hash=source_file_hash,
+            status="PROCESSING",
+            started_at=started_at,
+        )
+
+        print(
+            "[Lakehouse][Bronze][Validation] "
+            f"Validando: {file_path.name}"
+        )
+
+        validation_result = validate_input_file(file_path)
+        validation_results.append(validation_result)
+
+        if not validation_result.is_valid:
+            print(
+                "[Lakehouse][Bronze][Validation] "
+                f"INVALID | arquivo={file_path.name} "
+                f"| motivo={validation_result.error_message}"
+            )
+
+            record_ingestion_status(
+                control_path,
+                batch_id=batch_id,
+                source_file=file_path.name,
+                source_file_hash=source_file_hash,
+                status="FAILED",
+                started_at=started_at,
+                finished_at=datetime.now(timezone.utc),
+                row_count=validation_result.row_count,
+                inserted_row_count=0,
+                duplicate_row_count=0,
+                error_message=validation_result.error_message,
+            )
+
+            quarantined_file = move_file_to_quarantine(
+                validation_result=validation_result,
+                quarantine_path=quarantine_path,
+            )
+
+            print(
+                "[Lakehouse][Bronze][Quarantine] "
+                f"Movido para: {quarantined_file}"
+            )
+            continue
+
+        print(
+            "[Lakehouse][Bronze][Validation] "
+            f"VALID | arquivo={file_path.name} "
+            f"| linhas={validation_result.row_count} "
+            f"| encoding={validation_result.detected_encoding}"
+        )
+
+        if file_path.name != LEGACY_SOURCE_FILE:
+            record_ingestion_status(
+                control_path,
+                batch_id=batch_id,
+                source_file=file_path.name,
+                source_file_hash=source_file_hash,
+                status="SKIPPED",
+                started_at=started_at,
+                finished_at=datetime.now(timezone.utc),
+                row_count=validation_result.row_count,
+                inserted_row_count=0,
+                duplicate_row_count=0,
+                status_reason=(
+                    "Arquivo estruturalmente válido, mas o "
+                    "processamento múltiplo ainda não foi ativado."
+                ),
+            )
+            continue
+
+        try:
+            write_current_bronze_table(
+                project_dir=project_dir,
+                validation_result=validation_result,
+                batch_id=batch_id,
+            )
+        except Exception as error:
+            record_ingestion_status(
+                control_path,
+                batch_id=batch_id,
+                source_file=file_path.name,
+                source_file_hash=source_file_hash,
+                status="FAILED",
+                started_at=started_at,
+                finished_at=datetime.now(timezone.utc),
+                row_count=validation_result.row_count,
+                inserted_row_count=0,
+                duplicate_row_count=0,
+                error_message=str(error),
+            )
+            raise
+
+        record_ingestion_status(
+            control_path,
+            batch_id=batch_id,
+            source_file=file_path.name,
+            source_file_hash=source_file_hash,
+            status="SUCCESS",
+            started_at=started_at,
+            finished_at=datetime.now(timezone.utc),
+            row_count=validation_result.row_count,
+            inserted_row_count=validation_result.row_count,
+            duplicate_row_count=0,
+        )
+
+        successful_file_hashes.add(source_file_hash)
+
+    return validation_results
+
+
 def print_validation_summary(
     validation_results: list[FileValidationResult],
 ) -> None:
@@ -756,21 +1186,18 @@ def print_validation_summary(
 
 def load_bronze_data() -> list[FileValidationResult]:
     """
-    Executa a Sprint 3 da Bronze.
+    Executa a Sprint 4 da Bronze.
 
     Responsabilidades:
-    1. criar inbox, archive e quarantine;
-    2. descobrir todos os CSVs da inbox;
-    3. validar cada arquivo isoladamente;
-    4. mover arquivos estruturalmente inválidos para quarantine;
-    5. gerar metadados de arquivo, linha, batch e ingestão;
-    6. preservar a escrita do arquivo esperado pela Silver atual.
-
-    Arquivos válidos diferentes do arquivo legado permanecem na inbox
-    aguardando a Sprint de processamento múltiplo.
+    1. descobrir e validar arquivos individualmente;
+    2. manter os metadados de linhagem da Sprint 3;
+    3. registrar PROCESSING, SUCCESS, FAILED e SKIPPED;
+    4. não reprocessar hashes já concluídos com SUCCESS;
+    5. preservar temporariamente a escrita do arquivo legado.
     """
     project_dir = Path(__file__).resolve().parent.parent
     batch_id = generate_batch_id()
+    control_path = get_control_table_path(project_dir)
 
     print(
         "[Lakehouse][Bronze] "
@@ -796,61 +1223,45 @@ def load_bronze_data() -> list[FileValidationResult]:
         "[Lakehouse][Bronze] "
         f"Quarantine: {quarantine_path}"
     )
+    print(
+        "[Lakehouse][Control] "
+        f"Tabela: {control_path}"
+    )
 
     input_files = discover_input_files(inbox_path)
+    input_files = add_legacy_root_file_if_needed(
+        input_files=input_files,
+        raw_path=raw_path,
+    )
     print_discovered_files(input_files)
 
-    validation_results = validate_discovered_files(
+    if not input_files:
+        print(
+            "[Lakehouse][Bronze] "
+            "Nada para processar nesta execução."
+        )
+        return []
+
+    successful_file_hashes = load_successful_file_hashes(
+        control_path
+    )
+
+    print(
+        "[Lakehouse][Control] "
+        "Hashes concluídos anteriormente: "
+        f"{len(successful_file_hashes)}"
+    )
+
+    validation_results = process_input_files_with_control(
+        project_dir=project_dir,
         input_files=input_files,
         quarantine_path=quarantine_path,
+        control_path=control_path,
+        batch_id=batch_id,
+        successful_file_hashes=successful_file_hashes,
     )
-
-    legacy_result = find_valid_legacy_source(
-        validation_results
-    )
-
-    if legacy_result is None:
-        root_legacy_result = validate_legacy_root_file(
-            raw_path=raw_path,
-            quarantine_path=quarantine_path,
-        )
-
-        if (
-            root_legacy_result is not None
-            and root_legacy_result.is_valid
-        ):
-            legacy_result = root_legacy_result
-            validation_results.append(root_legacy_result)
 
     print_validation_summary(validation_results)
-
-    if legacy_result is None:
-        valid_files = [
-            result.source_path.name
-            for result in validation_results
-            if result.is_valid
-        ]
-
-        if valid_files:
-            print(
-                "[Lakehouse][Bronze][WARNING] "
-                "Existem arquivos válidos, mas eles ainda não serão "
-                "gravados nesta sprint. A Silver atual espera "
-                f"{LEGACY_SOURCE_FILE}."
-            )
-        else:
-            print(
-                "[Lakehouse][Bronze] "
-                "Nenhum arquivo válido disponível para escrita."
-            )
-
-        return validation_results
-
-    write_current_bronze_table(
-        project_dir=project_dir,
-        validation_result=legacy_result,
-        batch_id=batch_id,
-    )
 
     return validation_results
 
