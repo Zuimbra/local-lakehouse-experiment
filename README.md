@@ -33,7 +33,7 @@ data/
 
 ## 🛠️ Tech Stack
 
-- **Python 3.13**
+- **Python 3.14**
 - **DuckDB** — Motor de consulta SQL local
 - **Delta Lake** (`deltalake`) — Formato de tabela transacional
 - **Pandas / PyArrow** — Manipulação de dados

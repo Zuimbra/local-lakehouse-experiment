@@ -8,6 +8,7 @@ from fastapi import (
     Response,
     status,
 )
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
 from .lakehouse_reader import (
@@ -29,6 +30,28 @@ app = FastAPI(
         "do Lakehouse."
     ),
     version="0.5.0",
+)
+
+
+# ============================================================
+# CORS
+# ============================================================
+
+# Permite que o dashboard executado localmente acesse a API.
+#
+# O Vite pode usar a porta 8080, conforme a configuração do
+# dashboard, ou a porta padrão 5173.
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        "http://localhost:8080",
+        "http://127.0.0.1:8080",
+        "http://localhost:5173",
+        "http://127.0.0.1:5173",
+    ],
+    allow_credentials=False,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 
