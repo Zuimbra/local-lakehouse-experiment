@@ -3,13 +3,27 @@ from __future__ import annotations
 import shutil
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from hashlib import sha256
 from pathlib import Path
+from uuid import uuid4
 
 import pandas as pd
 from pandas.errors import EmptyDataError, ParserError
 
 
 LEGACY_SOURCE_FILE = "logs_rastreador_2026-07-01.csv"
+
+METADATA_COLUMNS = (
+    "source_file",
+    "source_file_hash",
+    "source_row_number",
+    "row_id",
+    "batch_id",
+    "ingested_at",
+    "ingestion_date",
+)
+
+FILE_HASH_CHUNK_SIZE = 1024 * 1024
 
 # A Silver atual referencia diretamente todas essas colunas.
 # Colunas adicionais são permitidas, mas nenhuma destas pode faltar.
@@ -65,6 +79,7 @@ class FileValidationResult:
     row_count: int = 0
     dataframe: pd.DataFrame | None = None
     missing_columns: tuple[str, ...] = ()
+    reserved_columns: tuple[str, ...] = ()
     error_message: str | None = None
     detected_encoding: str | None = None
 
@@ -194,7 +209,8 @@ def validate_dataframe_schema(
     """
     Retorna as colunas esperadas que não existem no DataFrame.
 
-    Colunas extras são aceitas.
+    Colunas extras são aceitas, exceto os nomes reservados para
+    metadados produzidos pela própria camada Bronze.
     """
     available_columns = set(dataframe.columns)
 
@@ -202,6 +218,23 @@ def validate_dataframe_schema(
         column
         for column in EXPECTED_COLUMNS
         if column not in available_columns
+    )
+
+
+def find_reserved_metadata_columns(
+    dataframe: pd.DataFrame,
+) -> tuple[str, ...]:
+    """
+    Impede que o arquivo bruto forneça metadados de linhagem.
+
+    Esses campos precisam ser gerados exclusivamente pelo pipeline.
+    """
+    available_columns = set(dataframe.columns)
+
+    return tuple(
+        column
+        for column in METADATA_COLUMNS
+        if column in available_columns
     )
 
 
@@ -278,6 +311,7 @@ def validate_input_file(
         )
 
     missing_columns = validate_dataframe_schema(dataframe)
+    reserved_columns = find_reserved_metadata_columns(dataframe)
 
     if missing_columns:
         return FileValidationResult(
@@ -289,6 +323,20 @@ def validate_input_file(
             error_message=(
                 "O arquivo não possui todas as colunas "
                 "necessárias para o pipeline."
+            ),
+            detected_encoding=detected_encoding,
+        )
+
+    if reserved_columns:
+        return FileValidationResult(
+            source_path=file_path,
+            is_valid=False,
+            row_count=len(dataframe),
+            dataframe=None,
+            reserved_columns=reserved_columns,
+            error_message=(
+                "O arquivo utiliza nomes de colunas reservados "
+                "para metadados da Bronze."
             ),
             detected_encoding=detected_encoding,
         )
@@ -357,6 +405,11 @@ def move_file_to_quarantine(
         if validation_result.missing_columns
         else "Nenhuma"
     )
+    reserved_columns_text = (
+        ", ".join(validation_result.reserved_columns)
+        if validation_result.reserved_columns
+        else "Nenhuma"
+    )
 
     report_content = "\n".join(
         (
@@ -364,6 +417,7 @@ def move_file_to_quarantine(
             f"quarantined_at={datetime.now(timezone.utc).isoformat()}",
             f"reason={validation_result.error_message}",
             f"missing_columns={missing_columns_text}",
+            f"reserved_columns={reserved_columns_text}",
             f"detected_encoding={validation_result.detected_encoding}",
             f"row_count={validation_result.row_count}",
         )
@@ -417,6 +471,13 @@ def validate_discovered_files(
                 "[Lakehouse][Bronze][Validation] "
                 "Colunas ausentes: "
                 + ", ".join(result.missing_columns)
+            )
+
+        if result.reserved_columns:
+            print(
+                "[Lakehouse][Bronze][Validation] "
+                "Colunas reservadas encontradas: "
+                + ", ".join(result.reserved_columns)
             )
 
         quarantined_file = move_file_to_quarantine(
@@ -483,22 +544,145 @@ def validate_legacy_root_file(
     return result
 
 
+def calculate_file_hash(
+    file_path: Path,
+    chunk_size: int = FILE_HASH_CHUNK_SIZE,
+) -> str:
+    """
+    Calcula o SHA-256 do conteúdo binário do arquivo.
+
+    A leitura em blocos evita carregar o arquivo inteiro na memória.
+    """
+    if chunk_size <= 0:
+        raise ValueError("chunk_size precisa ser maior que zero.")
+
+    hasher = sha256()
+
+    with file_path.open("rb") as source_file:
+        for chunk in iter(
+            lambda: source_file.read(chunk_size),
+            b"",
+        ):
+            hasher.update(chunk)
+
+    return hasher.hexdigest()
+
+
+def generate_batch_id() -> str:
+    """
+    Gera o identificador único da execução da ingestão.
+    """
+    return str(uuid4())
+
+
+def normalize_ingestion_timestamp(
+    ingested_at: datetime | None = None,
+) -> datetime:
+    """
+    Normaliza o instante de ingestão para UTC.
+    """
+    timestamp = ingested_at or datetime.now(timezone.utc)
+
+    if timestamp.tzinfo is None:
+        return timestamp.replace(tzinfo=timezone.utc)
+
+    return timestamp.astimezone(timezone.utc)
+
+
+def calculate_row_id(
+    source_file_hash: str,
+    source_row_number: int,
+) -> str:
+    """
+    Gera um identificador determinístico para a linha de origem.
+
+    O batch_id não faz parte do cálculo. Assim, a mesma linha do mesmo
+    arquivo mantém o row_id quando a execução é repetida.
+    """
+    if source_row_number < 1:
+        raise ValueError(
+            "source_row_number precisa começar em 1."
+        )
+
+    identity = (
+        f"{source_file_hash}:{source_row_number}"
+        .encode("utf-8")
+    )
+
+    return sha256(identity).hexdigest()
+
+
+def prepare_bronze_dataframe(
+    validation_result: FileValidationResult,
+    batch_id: str,
+    ingested_at: datetime | None = None,
+) -> pd.DataFrame:
+    """
+    Acrescenta os metadados técnicos sem alterar as colunas brutas.
+    """
+    if not validation_result.is_valid:
+        raise ValueError(
+            "Não é possível preparar um arquivo inválido."
+        )
+
+    if validation_result.dataframe is None:
+        raise ValueError(
+            "Um arquivo validado precisa possuir um DataFrame."
+        )
+
+    if not batch_id.strip():
+        raise ValueError("batch_id não pode ser vazio.")
+
+    source_path = validation_result.source_path
+    source_file_hash = calculate_file_hash(source_path)
+    ingestion_timestamp = normalize_ingestion_timestamp(
+        ingested_at
+    )
+
+    bronze_dataframe = validation_result.dataframe.copy()
+    source_row_numbers = list(
+        range(1, len(bronze_dataframe) + 1)
+    )
+
+    bronze_dataframe["source_file"] = source_path.name
+    bronze_dataframe["source_file_hash"] = source_file_hash
+    bronze_dataframe["source_row_number"] = source_row_numbers
+    bronze_dataframe["row_id"] = [
+        calculate_row_id(
+            source_file_hash=source_file_hash,
+            source_row_number=row_number,
+        )
+        for row_number in source_row_numbers
+    ]
+    bronze_dataframe["batch_id"] = batch_id
+    bronze_dataframe["ingested_at"] = pd.Timestamp(
+        ingestion_timestamp
+    )
+    bronze_dataframe["ingestion_date"] = (
+        ingestion_timestamp.date().isoformat()
+    )
+
+    return bronze_dataframe
+
+
 def write_current_bronze_table(
     project_dir: Path,
     validation_result: FileValidationResult,
-) -> None:
+    batch_id: str,
+    ingested_at: datetime | None = None,
+) -> Path:
     """
-    Preserva a escrita atual de uma única Delta Table.
+    Preserva a escrita atual de uma única Delta Table, agora com
+    metadados técnicos de ingestão.
 
     O processamento consolidado dos demais arquivos será implementado
     nas próximas sprints.
     """
-    dataframe = validation_result.dataframe
-
-    if dataframe is None:
-        raise ValueError(
-            "Um arquivo validado precisa possuir um DataFrame."
-        )
+    dataframe = prepare_bronze_dataframe(
+        validation_result=validation_result,
+        batch_id=batch_id,
+        ingested_at=ingested_at,
+    )
 
     raw_file_path = validation_result.source_path
 
@@ -529,6 +713,7 @@ def write_current_bronze_table(
             bronze_path,
             dataframe,
             mode="overwrite",
+            schema_mode="overwrite",
         )
 
     except Exception as error:
@@ -541,6 +726,12 @@ def write_current_bronze_table(
         "[Lakehouse][Bronze] "
         f"Delta Table gravada com sucesso: {bronze_path}"
     )
+    print(
+        "[Lakehouse][Bronze] "
+        f"Batch: {batch_id} | linhas={len(dataframe)}"
+    )
+
+    return bronze_path
 
 
 def print_validation_summary(
@@ -565,19 +756,26 @@ def print_validation_summary(
 
 def load_bronze_data() -> list[FileValidationResult]:
     """
-    Executa a Sprint 2 da Bronze.
+    Executa a Sprint 3 da Bronze.
 
     Responsabilidades:
     1. criar inbox, archive e quarantine;
     2. descobrir todos os CSVs da inbox;
     3. validar cada arquivo isoladamente;
     4. mover arquivos estruturalmente inválidos para quarantine;
-    5. preservar a escrita do arquivo esperado pela Silver atual.
+    5. gerar metadados de arquivo, linha, batch e ingestão;
+    6. preservar a escrita do arquivo esperado pela Silver atual.
 
     Arquivos válidos diferentes do arquivo legado permanecem na inbox
     aguardando a Sprint de processamento múltiplo.
     """
     project_dir = Path(__file__).resolve().parent.parent
+    batch_id = generate_batch_id()
+
+    print(
+        "[Lakehouse][Bronze] "
+        f"Iniciando batch: {batch_id}"
+    )
 
     (
         raw_path,
@@ -651,6 +849,7 @@ def load_bronze_data() -> list[FileValidationResult]:
     write_current_bronze_table(
         project_dir=project_dir,
         validation_result=legacy_result,
+        batch_id=batch_id,
     )
 
     return validation_results
