@@ -7,6 +7,7 @@ from datetime import date, datetime, timezone
 from pathlib import Path
 
 import pandas as pd
+import pyarrow as pa
 from deltalake import DeltaTable, write_deltalake
 
 
@@ -17,12 +18,14 @@ if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
 from lakehouse_02_silver import (  # noqa: E402
-    BRONZE_METADATA_COLUMNS,
     BRONZE_TABLE_NAME,
-    get_delta_column_names,
+    SilverLoadResult,
+    validate_arrow_partition_column,
+    discover_affected_partitions,
     get_lakehouse_paths,
     load_silver_data,
-    validate_bronze_metadata,
+    normalize_batch_ids,
+    silver_supports_incremental_update,
 )
 
 
@@ -67,43 +70,29 @@ RAW_COLUMNS = (
 )
 
 
-def empty_raw_record() -> dict[str, object]:
-    return {
-        column: ""
-        for column in RAW_COLUMNS
-    }
+def raw_record(**overrides) -> dict[str, object]:
+    row = {column: "" for column in RAW_COLUMNS}
+    row.update(overrides)
+    return row
 
 
-def build_bronze_dataframe() -> pd.DataFrame:
-    telemetry = empty_raw_record()
-    telemetry.update(
+def add_metadata(
+    row: dict[str, object],
+    *,
+    source_file: str,
+    source_file_hash: str,
+    row_id: str,
+    batch_id: str,
+    source_row_number: int = 1,
+    ingestion_date: date = date(2026, 8, 10),
+) -> dict[str, object]:
+    row.update(
         {
-            "DATA_SERVIDOR": "2026-08-10 10:00:01",
-            "TM_STAMP": "2026-08-10 10:00:00",
-            "TIPO_LOG": "TRACKER",
-            "MESS_TYPE": "T2",
-            "REPT_TYPE": "1",
-            "PRT_VER": "1",
-            "S/N ou IMEI": "M123456789",
-            "TERM_STATUS": "OK",
-            "BAT_VOLT": "12.5",
-            "LOC_STATUS": "A",
-            "LAT": "-3.7319",
-            "LONT": "-38.5267",
-            "SPEED": "42",
-            "DIR": "180",
-            "INT_BATT": "4.1",
-            "ODO_TRIP": "10",
-            "ODO_TOTAL": "1000",
-            "HORIMETER": "20",
-            "HDOP": "1.2",
-            "SER_COUNT": "10",
-            "RPM": "1500",
-            "source_file": "telemetry.csv",
-            "source_file_hash": "hash-telemetry",
-            "source_row_number": 1,
-            "row_id": "row-telemetry",
-            "batch_id": "batch-1",
+            "source_file": source_file,
+            "source_file_hash": source_file_hash,
+            "source_row_number": source_row_number,
+            "row_id": row_id,
+            "batch_id": batch_id,
             "ingested_at": datetime(
                 2026,
                 8,
@@ -112,273 +101,492 @@ def build_bronze_dataframe() -> pd.DataFrame:
                 0,
                 tzinfo=timezone.utc,
             ),
-            "ingestion_date": date(2026, 8, 10),
+            "ingestion_date": ingestion_date,
         }
     )
+    return row
 
-    identity = empty_raw_record()
-    identity.update(
-        {
-            "DATA_SERVIDOR": "2026-08-10 10:05:01",
-            "TM_STAMP": "2026-08-10 10:05:00",
-            "TIPO_LOG": "TRACKER",
-            "MESS_TYPE": "T1",
-            "REPT_TYPE": "1",
-            "PRT_VER": "1",
-            "S/N ou IMEI": "M123456789",
-            "BAT_VOLT": "89550500000000000001",
-            "LOC_STATUS": "IDENTITY",
-            "LAT": "724001234567890",
-            "LONT": "359881234567890",
-            "source_file": "identity.csv",
-            "source_file_hash": "hash-identity",
-            "source_row_number": 1,
-            "row_id": "row-identity",
-            "batch_id": "batch-1",
-            "ingested_at": datetime(
-                2026,
-                8,
-                10,
-                13,
-                1,
-                tzinfo=timezone.utc,
-            ),
-            "ingestion_date": date(2026, 8, 10),
-        }
-    )
 
-    rejected = empty_raw_record()
-    rejected.update(
-        {
-            "DATA_SERVIDOR": "",
-            "TM_STAMP": "",
-            "TIPO_LOG": "TRACKER",
-            "MESS_TYPE": "T2",
-            "REPT_TYPE": "1",
-            "PRT_VER": "1",
-            "S/N ou IMEI": "M123456789",
-            "source_file": "invalid.csv",
-            "source_file_hash": "hash-invalid",
-            "source_row_number": 1,
-            "row_id": "row-invalid",
-            "batch_id": "batch-1",
-            "ingested_at": datetime(
-                2026,
-                8,
-                10,
-                13,
-                2,
-                tzinfo=timezone.utc,
-            ),
-            "ingestion_date": date(2026, 8, 10),
-        }
-    )
-
-    return pd.DataFrame(
-        [telemetry, identity, rejected]
+def telemetry_row(
+    event_timestamp: str,
+    *,
+    batch_id: str,
+    row_id: str,
+    source_file: str,
+) -> dict[str, object]:
+    return add_metadata(
+        raw_record(
+            DATA_SERVIDOR=event_timestamp,
+            TM_STAMP=event_timestamp,
+            TIPO_LOG="TRACKER",
+            MESS_TYPE="T2",
+            REPT_TYPE="1",
+            PRT_VER="1",
+            **{
+                "S/N ou IMEI": "M123456789",
+                "TERM_STATUS": "OK",
+                "BAT_VOLT": "12.5",
+                "LOC_STATUS": "A",
+                "LAT": "-3.7319",
+                "LONT": "-38.5267",
+                "SPEED": "42",
+                "DIR": "180",
+                "INT_BATT": "4.1",
+                "ODO_TRIP": "10",
+                "ODO_TOTAL": "1000",
+                "HORIMETER": "20",
+                "HDOP": "1.2",
+                "SER_COUNT": "10",
+            },
+        ),
+        source_file=source_file,
+        source_file_hash=f"hash-{row_id}",
+        row_id=row_id,
+        batch_id=batch_id,
     )
 
 
-def create_test_bronze(
-    project_dir: Path,
-) -> Path:
-    bronze_path = (
+def identity_row(
+    event_timestamp: str,
+    *,
+    batch_id: str,
+    row_id: str,
+) -> dict[str, object]:
+    return add_metadata(
+        raw_record(
+            DATA_SERVIDOR=event_timestamp,
+            TM_STAMP=event_timestamp,
+            TIPO_LOG="TRACKER",
+            MESS_TYPE="T1",
+            REPT_TYPE="1",
+            PRT_VER="1",
+            **{
+                "S/N ou IMEI": "M123456789",
+                "BAT_VOLT": "89550500000000000001",
+                "LOC_STATUS": "IDENTITY",
+                "LAT": "724001234567890",
+                "LONT": "359881234567890",
+            },
+        ),
+        source_file="identity.csv",
+        source_file_hash=f"hash-{row_id}",
+        row_id=row_id,
+        batch_id=batch_id,
+    )
+
+
+def invalid_timestamp_row(
+    *,
+    batch_id: str,
+    row_id: str,
+) -> dict[str, object]:
+    return add_metadata(
+        raw_record(
+            DATA_SERVIDOR="",
+            TM_STAMP="invalid",
+            TIPO_LOG="TRACKER",
+            MESS_TYPE="T2",
+            REPT_TYPE="1",
+            PRT_VER="1",
+            **{
+                "S/N ou IMEI": "M123456789",
+            },
+        ),
+        source_file="invalid.csv",
+        source_file_hash=f"hash-{row_id}",
+        row_id=row_id,
+        batch_id=batch_id,
+    )
+
+
+def bronze_path(project_dir: Path) -> Path:
+    return (
         project_dir
         / "data"
         / "lakehouse"
         / "01_bronze"
         / BRONZE_TABLE_NAME
     )
-    bronze_path.parent.mkdir(
-        parents=True,
-        exist_ok=True,
-    )
+
+
+def write_bronze(
+    project_dir: Path,
+    rows: list[dict[str, object]],
+    *,
+    mode: str = "overwrite",
+) -> None:
+    path = bronze_path(project_dir)
+    path.parent.mkdir(parents=True, exist_ok=True)
 
     write_deltalake(
-        bronze_path,
-        build_bronze_dataframe(),
-        mode="overwrite",
-        partition_by=["ingestion_date"],
+        path,
+        pd.DataFrame(rows),
+        mode=mode,
+        schema_mode=(
+            "merge"
+            if mode == "append"
+            else "overwrite"
+        ),
+        partition_by=(
+            ["ingestion_date"]
+            if mode == "overwrite"
+            else None
+        ),
     )
 
-    return bronze_path
 
-
-class SilverSprint6Tests(unittest.TestCase):
-    def test_paths_use_consolidated_bronze(self) -> None:
-        paths = get_lakehouse_paths(Path("project"))
-
-        self.assertEqual(
-            paths["bronze"],
-            (
-                Path("project")
-                / "data"
-                / "lakehouse"
-                / "01_bronze"
-                / "tracker_logs"
-            ),
+class SilverSprint7Tests(unittest.TestCase):
+    def test_empty_arrow_partition_preserves_string_type(self) -> None:
+        table = pa.table(
+            {
+                "event_date": pa.array(
+                    [],
+                    type=pa.string(),
+                ),
+                "log_type": pa.array(
+                    [],
+                    type=pa.string(),
+                ),
+            }
         )
 
-    def test_delta_column_names(self) -> None:
+        # Não deve gerar exceção.
+        validate_arrow_partition_column(
+            table,
+            "event_date",
+        )
+
+        self.assertTrue(
+            pa.types.is_string(
+                table.schema.field(
+                    "log_type"
+                ).type
+            )
+        )
+
+    def test_normalize_batch_ids(self) -> None:
+        self.assertEqual(
+            normalize_batch_ids(
+                [" b ", "a", "a", ""]
+            ),
+            ("a", "b"),
+        )
+
+    def test_full_rebuild_migrates_partition_schema(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             project_dir = Path(temporary_directory)
-            bronze_path = create_test_bronze(project_dir)
 
-            table = DeltaTable(str(bronze_path))
-            columns = get_delta_column_names(table)
-
-            self.assertIn("row_id", columns)
-            self.assertIn("source_file", columns)
-            self.assertIn("batch_id", columns)
-
-    def test_bronze_metadata_validation_accepts_sprint5(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary_directory:
-            project_dir = Path(temporary_directory)
-            bronze_path = create_test_bronze(project_dir)
-
-            table = DeltaTable(str(bronze_path))
-
-            # Não deve gerar exceção.
-            validate_bronze_metadata(table)
-
-    def test_bronze_metadata_validation_rejects_old_bronze(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary_directory:
-            table_path = Path(temporary_directory) / "old_bronze"
-
-            old_dataframe = pd.DataFrame(
+            write_bronze(
+                project_dir,
                 [
-                    {
-                        column: ""
-                        for column in RAW_COLUMNS
-                    }
-                ]
+                    telemetry_row(
+                        "2026-08-10 10:00:00",
+                        batch_id="batch-1",
+                        row_id="row-1",
+                        source_file="a.csv",
+                    )
+                ],
             )
 
-            write_deltalake(
-                table_path,
-                old_dataframe,
-                mode="overwrite",
+            result = load_silver_data(
+                project_dir=project_dir
             )
 
-            table = DeltaTable(str(table_path))
-
-            with self.assertRaises(ValueError):
-                validate_bronze_metadata(table)
-
-    def test_silver_reads_multiple_files_and_preserves_lineage(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary_directory:
-            project_dir = Path(temporary_directory)
-            create_test_bronze(project_dir)
-
-            load_silver_data(project_dir=project_dir)
+            self.assertIsInstance(
+                result,
+                SilverLoadResult,
+            )
+            self.assertEqual(result.mode, "FULL")
 
             paths = get_lakehouse_paths(project_dir)
-
             telemetry = DeltaTable(
                 str(paths["telemetry"])
             ).to_pandas()
 
-            identity = DeltaTable(
-                str(paths["identity"])
-            ).to_pandas()
-
-            rejected = DeltaTable(
-                str(paths["rejected"])
-            ).to_pandas()
-
-            self.assertEqual(len(telemetry), 1)
-            self.assertEqual(len(identity), 1)
-            self.assertEqual(len(rejected), 1)
-
-            for dataframe in (
-                telemetry,
-                identity,
-                rejected,
-            ):
-                for column in BRONZE_METADATA_COLUMNS:
-                    self.assertIn(
-                        column,
-                        dataframe.columns,
-                    )
-
             self.assertEqual(
-                telemetry.iloc[0]["source_file"],
-                "telemetry.csv",
+                telemetry["event_date"].tolist(),
+                ["2026-08-10"],
             )
-            self.assertEqual(
-                telemetry.iloc[0]["row_id"],
-                "row-telemetry",
+            self.assertTrue(
+                silver_supports_incremental_update(
+                    paths
+                )
             )
 
-            self.assertEqual(
-                identity.iloc[0]["source_file"],
-                "identity.csv",
-            )
-            self.assertEqual(
-                identity.iloc[0]["row_id"],
-                "row-identity",
-            )
-
-            self.assertEqual(
-                rejected.iloc[0]["source_file"],
-                "invalid.csv",
-            )
-            self.assertEqual(
-                rejected.iloc[0]["row_id"],
-                "row-invalid",
-            )
-            self.assertEqual(
-                rejected.iloc[0]["rejection_reason"],
-                "MISSING_OR_INVALID_TIMESTAMP",
-            )
-
-    def test_silver_rebuild_migrates_existing_schema(self) -> None:
+    def test_incremental_late_file_rebuilds_only_affected_date(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             project_dir = Path(temporary_directory)
-            create_test_bronze(project_dir)
 
-            paths = get_lakehouse_paths(project_dir)
-            paths["silver"].mkdir(
-                parents=True,
-                exist_ok=True,
-            )
-
-            # Simula tabela Silver anterior à Sprint 6.
-            old_telemetry = pd.DataFrame(
-                {
-                    # Simula a representação temporal produzida pelo
-                    # fluxo DuckDB -> Pandas usado pela Silver real.
-                    "event_date": pd.to_datetime(
-                        ["2026-08-09"]
+            write_bronze(
+                project_dir,
+                [
+                    telemetry_row(
+                        "2026-08-10 10:00:00",
+                        batch_id="batch-1",
+                        row_id="row-1",
+                        source_file="a.csv",
                     ),
-                    "source_file": ["old.csv"],
-                }
-            )
-
-            write_deltalake(
-                paths["telemetry"],
-                old_telemetry,
-                mode="overwrite",
-                partition_by=["event_date"],
+                    telemetry_row(
+                        "2026-08-11 10:00:00",
+                        batch_id="batch-1",
+                        row_id="row-2",
+                        source_file="a.csv",
+                    ),
+                ],
             )
 
             load_silver_data(project_dir=project_dir)
 
-            migrated = DeltaTable(
+            paths = get_lakehouse_paths(project_dir)
+            telemetry_table = DeltaTable(
                 str(paths["telemetry"])
+            )
+            version_before = telemetry_table.version()
+
+            write_bronze(
+                project_dir,
+                [
+                    telemetry_row(
+                        "2026-08-10 11:00:00",
+                        batch_id="batch-2",
+                        row_id="row-3",
+                        source_file="late.csv",
+                    )
+                ],
+                mode="append",
+            )
+
+            result = load_silver_data(
+                project_dir=project_dir,
+                batch_ids={"batch-2"},
+            )
+
+            self.assertEqual(
+                result.mode,
+                "INCREMENTAL",
+            )
+            self.assertEqual(
+                result.affected_event_dates,
+                ("2026-08-10",),
+            )
+
+            telemetry_table = DeltaTable(
+                str(paths["telemetry"])
+            )
+            telemetry = telemetry_table.to_pandas()
+
+            august_10 = telemetry.loc[
+                telemetry["event_date"]
+                == "2026-08-10"
+            ]
+            august_11 = telemetry.loc[
+                telemetry["event_date"]
+                == "2026-08-11"
+            ]
+
+            self.assertEqual(len(august_10), 2)
+            self.assertEqual(len(august_11), 1)
+            self.assertGreater(
+                telemetry_table.version(),
+                version_before,
+            )
+
+    def test_incremental_identity_batch_updates_identity_partition(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            project_dir = Path(temporary_directory)
+
+            write_bronze(
+                project_dir,
+                [
+                    identity_row(
+                        "2026-08-10 10:00:00",
+                        batch_id="batch-1",
+                        row_id="identity-1",
+                    )
+                ],
+            )
+            load_silver_data(project_dir=project_dir)
+
+            write_bronze(
+                project_dir,
+                [
+                    identity_row(
+                        "2026-08-10 11:00:00",
+                        batch_id="batch-2",
+                        row_id="identity-2",
+                    )
+                ],
+                mode="append",
+            )
+
+            result = load_silver_data(
+                project_dir=project_dir,
+                batch_ids={"batch-2"},
+            )
+
+            identity = DeltaTable(
+                str(
+                    get_lakehouse_paths(
+                        project_dir
+                    )["identity"]
+                )
+            ).to_pandas()
+
+            self.assertEqual(result.mode, "INCREMENTAL")
+            self.assertEqual(len(identity), 2)
+
+    def test_empty_rejected_schema_accepts_first_real_rejection(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            project_dir = Path(temporary_directory)
+
+            # Primeiro rebuild: rejected_logs será criada vazia.
+            write_bronze(
+                project_dir,
+                [
+                    telemetry_row(
+                        "2026-08-10 10:00:00",
+                        batch_id="batch-1",
+                        row_id="telemetry-1",
+                        source_file="a.csv",
+                    )
+                ],
+            )
+
+            load_silver_data(project_dir=project_dir)
+
+            rejected_path = get_lakehouse_paths(
+                project_dir
+            )["rejected"]
+
+            empty_rejected = DeltaTable(
+                str(rejected_path)
+            )
+
+            field_types = {
+                field.name: str(
+                    getattr(
+                        field.type,
+                        "type",
+                        field.type,
+                    )
+                ).lower()
+                for field in empty_rejected.schema().fields
+            }
+
+            # O schema vazio precisa preservar os tipos SQL.
+            self.assertEqual(
+                field_types["log_type"],
+                "string",
+            )
+
+            # Depois chega o primeiro rejeitado real.
+            write_bronze(
+                project_dir,
+                [
+                    invalid_timestamp_row(
+                        batch_id="batch-2",
+                        row_id="invalid-1",
+                    )
+                ],
+                mode="append",
+            )
+
+            result = load_silver_data(
+                project_dir=project_dir,
+                batch_ids={"batch-2"},
+            )
+
+            rejected = DeltaTable(
+                str(rejected_path)
+            ).to_pandas()
+
+            self.assertEqual(
+                result.mode,
+                "INCREMENTAL",
+            )
+            self.assertEqual(len(rejected), 1)
+            self.assertEqual(
+                rejected.iloc[0]["log_type"],
+                "TRACKER",
+            )
+
+    def test_unknown_rejection_partition_is_reprocessed(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            project_dir = Path(temporary_directory)
+
+            write_bronze(
+                project_dir,
+                [
+                    telemetry_row(
+                        "2026-08-10 10:00:00",
+                        batch_id="batch-1",
+                        row_id="telemetry-1",
+                        source_file="a.csv",
+                    )
+                ],
+            )
+            load_silver_data(project_dir=project_dir)
+
+            write_bronze(
+                project_dir,
+                [
+                    invalid_timestamp_row(
+                        batch_id="batch-2",
+                        row_id="invalid-1",
+                    )
+                ],
+                mode="append",
+            )
+
+            result = load_silver_data(
+                project_dir=project_dir,
+                batch_ids={"batch-2"},
+            )
+
+            rejected = DeltaTable(
+                str(
+                    get_lakehouse_paths(
+                        project_dir
+                    )["rejected"]
+                )
             ).to_pandas()
 
             self.assertIn(
-                "source_file_hash",
-                migrated.columns,
+                "unknown",
+                result.affected_rejection_dates,
             )
-            self.assertIn(
-                "row_id",
-                migrated.columns,
+            self.assertEqual(len(rejected), 1)
+            self.assertEqual(
+                rejected.iloc[0]["rejection_date"],
+                "unknown",
             )
-            self.assertNotIn(
-                "old.csv",
-                migrated["source_file"].tolist(),
+
+    def test_unknown_batch_is_noop(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            project_dir = Path(temporary_directory)
+
+            write_bronze(
+                project_dir,
+                [
+                    telemetry_row(
+                        "2026-08-10 10:00:00",
+                        batch_id="batch-1",
+                        row_id="row-1",
+                        source_file="a.csv",
+                    )
+                ],
+            )
+            load_silver_data(project_dir=project_dir)
+
+            result = load_silver_data(
+                project_dir=project_dir,
+                batch_ids={"does-not-exist"},
+            )
+
+            self.assertEqual(result.mode, "NOOP")
+            self.assertEqual(
+                result.telemetry_rows_written,
+                0,
             )
 
 

@@ -1,8 +1,12 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
 from pathlib import Path
 
 import duckdb
+import pandas as pd
+import pyarrow as pa
+import pyarrow.compute as pc
 from deltalake import DeltaTable, write_deltalake
 
 
@@ -17,6 +21,24 @@ BRONZE_METADATA_COLUMNS = (
     "ingested_at",
     "ingestion_date",
 )
+
+
+@dataclass(frozen=True)
+class SilverLoadResult:
+    """
+    Resume o processamento executado pela Silver.
+
+    A Sprint 8 utilizará affected_event_dates para limitar também
+    o reprocessamento da Gold.
+    """
+
+    mode: str
+    batch_ids: tuple[str, ...]
+    affected_event_dates: tuple[str, ...]
+    affected_rejection_dates: tuple[str, ...]
+    telemetry_rows_written: int
+    identity_rows_written: int
+    rejected_rows_written: int
 
 
 def is_delta_table(path: Path) -> bool:
@@ -126,42 +148,494 @@ def validate_bronze_metadata(
         )
 
 
-def write_silver_table(
-    path: Path,
-    dataframe,
+def get_delta_field_type(
+    table_path: Path,
+    column_name: str,
+) -> str | None:
+    """
+    Retorna o tipo primitivo Delta de uma coluna.
+
+    PrimitiveType.type é a API pública do delta-rs para obter valores
+    como "string", "date", "timestamp" etc.
+    """
+    if not is_delta_table(table_path):
+        return None
+
+    table = DeltaTable(str(table_path))
+
+    for field in table.schema().fields:
+        if field.name != column_name:
+            continue
+
+        field_type = field.type
+        primitive_type = getattr(
+            field_type,
+            "type",
+            None,
+        )
+
+        if primitive_type is None:
+            return str(field_type).lower()
+
+        return str(primitive_type).lower()
+
+    return None
+
+
+def silver_supports_incremental_update(
+    paths: dict[str, Path],
+) -> bool:
+    """
+    Confirma que as tabelas Silver já estão no schema da Sprint 7.
+
+    event_date e rejection_date passam a ser strings YYYY-MM-DD.
+    Se o usuário vier diretamente da Sprint 6, a primeira execução
+    desta sprint fará um rebuild completo para migrar o schema.
+    """
+    expected = (
+        ("telemetry", "event_date"),
+        ("identity", "event_date"),
+        ("rejected", "rejection_date"),
+    )
+
+    for path_key, partition_column in expected:
+        table_path = paths[path_key]
+
+        if not is_delta_table(table_path):
+            return False
+
+        table = DeltaTable(str(table_path))
+
+        if table.metadata().partition_columns != [
+            partition_column
+        ]:
+            return False
+
+        field_type = get_delta_field_type(
+            table_path,
+            partition_column,
+        )
+
+        if field_type != "string":
+            return False
+
+    return True
+
+
+def normalize_batch_ids(
+    batch_ids: set[str] | list[str] | tuple[str, ...] | None,
+) -> tuple[str, ...]:
+    """
+    Limpa e ordena os batch_ids recebidos.
+    """
+    if batch_ids is None:
+        return ()
+
+    return tuple(
+        sorted(
+            {
+                str(batch_id).strip()
+                for batch_id in batch_ids
+                if str(batch_id).strip()
+            }
+        )
+    )
+
+
+def discover_affected_partitions(
+    con: duckdb.DuckDBPyConnection,
+    batch_ids: tuple[str, ...],
+) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    """
+    Descobre as partições Silver impactadas pelos batches informados.
+
+    Para timestamps válidos, a mesma data pode afetar telemetria,
+    identidade ou rejeições. Registros sem timestamp válido afetam a
+    partição especial rejected_logs/rejection_date=unknown.
+    """
+    if not batch_ids:
+        return (), ()
+
+    requested_batches = pd.DataFrame(
+        {"batch_id": list(batch_ids)}
+    )
+    con.register(
+        "requested_silver_batches",
+        requested_batches,
+    )
+
+    affected_dates_df = con.execute(
+        """
+        WITH requested_rows AS (
+            SELECT
+                COALESCE(
+                    TRY_CAST(
+                        bronze."TM_STAMP" AS TIMESTAMP
+                    ),
+                    TRY_CAST(
+                        bronze."DATA_SERVIDOR" AS TIMESTAMP
+                    )
+                ) AS event_timestamp
+
+            FROM bronze
+
+            INNER JOIN requested_silver_batches
+                ON CAST(bronze.batch_id AS VARCHAR)
+                 = requested_silver_batches.batch_id
+        )
+
+        SELECT DISTINCT
+            STRFTIME(
+                event_timestamp,
+                '%Y-%m-%d'
+            ) AS event_date
+
+        FROM requested_rows
+
+        WHERE event_timestamp IS NOT NULL
+
+        ORDER BY event_date
+        """
+    ).df()
+
+    has_unknown = bool(
+        con.execute(
+            """
+            SELECT EXISTS (
+                SELECT 1
+                FROM bronze
+                INNER JOIN requested_silver_batches
+                    ON CAST(
+                        bronze.batch_id AS VARCHAR
+                    ) = requested_silver_batches.batch_id
+                WHERE COALESCE(
+                    TRY_CAST(
+                        bronze."TM_STAMP" AS TIMESTAMP
+                    ),
+                    TRY_CAST(
+                        bronze."DATA_SERVIDOR" AS TIMESTAMP
+                    )
+                ) IS NULL
+            )
+            """
+        ).fetchone()[0]
+    )
+
+    event_dates = tuple(
+        affected_dates_df["event_date"]
+        .dropna()
+        .astype(str)
+        .tolist()
+    )
+
+    rejection_dates = (
+        (*event_dates, "unknown")
+        if has_unknown
+        else event_dates
+    )
+
+    return (
+        event_dates,
+        tuple(dict.fromkeys(rejection_dates)),
+    )
+
+
+def create_bronze_scope_view(
+    con: duckdb.DuckDBPyConnection,
     *,
+    full_rebuild: bool,
+    affected_event_dates: tuple[str, ...],
+    include_unknown_timestamp: bool,
+) -> None:
+    """
+    Cria a fonte de trabalho da Silver.
+
+    No modo incremental, NÃO filtramos somente os novos batches.
+    Filtramos todas as linhas Bronze das datas afetadas. Isso é o que
+    permite reconstruir uma partição completa de forma idempotente.
+    """
+    if full_rebuild:
+        con.execute(
+            """
+            CREATE OR REPLACE TEMP VIEW bronze_scope AS
+            SELECT *
+            FROM bronze
+            """
+        )
+        return
+
+    affected_dates = pd.DataFrame(
+        {"event_date": list(affected_event_dates)}
+    )
+    con.register(
+        "affected_silver_dates",
+        affected_dates,
+    )
+
+    unknown_sql = (
+        "TRUE"
+        if include_unknown_timestamp
+        else "FALSE"
+    )
+
+    con.execute(
+        f"""
+        CREATE OR REPLACE TEMP VIEW bronze_scope AS
+
+        WITH scoped AS (
+            SELECT
+                bronze.*,
+
+                COALESCE(
+                    TRY_CAST(
+                        bronze."TM_STAMP" AS TIMESTAMP
+                    ),
+                    TRY_CAST(
+                        bronze."DATA_SERVIDOR" AS TIMESTAMP
+                    )
+                ) AS _scope_event_timestamp
+
+            FROM bronze
+        )
+
+        SELECT
+            scoped.* EXCLUDE (_scope_event_timestamp)
+
+        FROM scoped
+
+        LEFT JOIN affected_silver_dates
+            ON STRFTIME(
+                scoped._scope_event_timestamp,
+                '%Y-%m-%d'
+            ) = affected_silver_dates.event_date
+
+        WHERE
+            affected_silver_dates.event_date IS NOT NULL
+
+            OR (
+                {unknown_sql}
+                AND scoped._scope_event_timestamp IS NULL
+            )
+        """
+    )
+
+
+def get_arrow_column_names(
+    table: pa.Table,
+) -> set[str]:
+    """
+    Retorna os nomes de colunas de uma tabela Arrow.
+    """
+    return set(table.column_names)
+
+
+def get_arrow_unique_strings(
+    table: pa.Table,
+    column_name: str,
+) -> tuple[str, ...]:
+    """
+    Retorna valores únicos não nulos de uma coluna Arrow como strings.
+    """
+    if column_name not in table.column_names:
+        return ()
+
+    values = {
+        str(value)
+        for value in table[column_name].to_pylist()
+        if value is not None
+    }
+
+    return tuple(sorted(values))
+
+
+def validate_arrow_partition_column(
+    table: pa.Table,
     partition_by: str,
 ) -> None:
     """
-    Faz rebuild completo de uma tabela Silver.
+    Confirma que a coluna de partição existe e é textual.
 
-    Sprint 6 ainda não é incremental. schema_mode='overwrite' é
-    necessário porque as tabelas Silver antigas não possuíam todos
-    os metadados de linhagem adicionados nesta sprint.
+    STRFTIME no DuckDB produz VARCHAR, então esse tipo deve permanecer
+    string mesmo quando a consulta retorna zero linhas.
     """
+    if partition_by not in table.column_names:
+        raise ValueError(
+            "Partition column is missing from Silver table: "
+            f"{partition_by}"
+        )
+
+    field = table.schema.field(partition_by)
+
+    if not (
+        pa.types.is_string(field.type)
+        or pa.types.is_large_string(field.type)
+    ):
+        raise ValueError(
+            "Silver partition column must be string: "
+            f"{partition_by}={field.type}"
+        )
+
+
+def write_full_silver_table(
+    path: Path,
+    table: pa.Table,
+    *,
+    partition_by: str,
+) -> int:
+    """
+    Rebuild completo preservando o schema tipado vindo do DuckDB.
+
+    Usar Arrow diretamente evita que resultados vazios ou colunas
+    totalmente NULL sejam inferidos como tipo Null pelo Pandas/Delta.
+    """
+    validate_arrow_partition_column(
+        table,
+        partition_by,
+    )
+
     write_deltalake(
         path,
-        dataframe,
+        table,
         mode="overwrite",
         schema_mode="overwrite",
         partition_by=[partition_by],
     )
 
+    return table.num_rows
+
+
+def escape_delta_string_literal(value: str) -> str:
+    """
+    Escapa aspas simples para uso em predicados SQL do Delta.
+    """
+    return value.replace("'", "''")
+
+
+def filter_arrow_partition(
+    table: pa.Table,
+    *,
+    partition_by: str,
+    partition_value: str,
+) -> pa.Table:
+    """
+    Filtra uma única partição sem converter os dados para Pandas.
+    """
+    column = table[partition_by]
+    mask = pc.equal(
+        column,
+        pa.scalar(
+            partition_value,
+            type=column.type,
+        ),
+    )
+
+    return table.filter(mask)
+
+
+def write_incremental_silver_partitions(
+    path: Path,
+    table: pa.Table,
+    *,
+    partition_by: str,
+) -> int:
+    """
+    Substitui somente as partições presentes na tabela Arrow.
+
+    O schema permanece exatamente o definido pelo DuckDB, inclusive
+    quando algumas colunas possuem somente NULL na partição atual.
+    """
+    validate_arrow_partition_column(
+        table,
+        partition_by,
+    )
+
+    if table.num_rows == 0:
+        return 0
+
+    if not is_delta_table(path):
+        raise RuntimeError(
+            "Incremental Silver requires an existing Delta Table: "
+            f"{path}"
+        )
+
+    partition_values = get_arrow_unique_strings(
+        table,
+        partition_by,
+    )
+
+    rows_written = 0
+
+    for partition_value in partition_values:
+        partition_table = filter_arrow_partition(
+            table,
+            partition_by=partition_by,
+            partition_value=partition_value,
+        )
+
+        escaped_value = escape_delta_string_literal(
+            partition_value
+        )
+
+        predicate = (
+            f"{partition_by} = '{escaped_value}'"
+        )
+
+        print(
+            "[Lakehouse][Silver][Incremental] "
+            f"Replacing {partition_by}={partition_value} "
+            f"| rows={partition_table.num_rows}"
+        )
+
+        write_deltalake(
+            path,
+            partition_table,
+            mode="overwrite",
+            predicate=predicate,
+        )
+
+        rows_written += partition_table.num_rows
+
+    return rows_written
+
+
+def write_silver_table(
+    path: Path,
+    table: pa.Table,
+    *,
+    partition_by: str,
+    full_rebuild: bool,
+) -> int:
+    """
+    Escolhe rebuild completo ou replaceWhere por partição.
+    """
+    if full_rebuild:
+        return write_full_silver_table(
+            path,
+            table,
+            partition_by=partition_by,
+        )
+
+    return write_incremental_silver_partitions(
+        path,
+        table,
+        partition_by=partition_by,
+    )
+
 
 def load_silver_data(
     project_dir: Path | None = None,
-) -> None:
+    batch_ids: set[str] | list[str] | tuple[str, ...] | None = None,
+) -> SilverLoadResult:
     """
-    Reconstrói a Silver inteira a partir da Bronze consolidada.
+    Atualiza a Silver a partir da Bronze consolidada.
 
-    Nesta sprint:
-    - Bronze: múltiplos arquivos + ingestão incremental;
-    - Silver: rebuild completo;
-    - Gold: rebuild completo.
+    - Sem batch_ids: rebuild completo, preservando compatibilidade
+      com o pipeline atual.
+    - Com batch_ids: descobre as datas afetadas e substitui somente
+      essas partições.
 
-    O parâmetro project_dir existe principalmente para facilitar
-    testes automatizados. O pipeline continua chamando a função sem
-    argumentos.
+    A Sprint 8 fará a Bronze retornar os batch_ids novos e conectará
+    automaticamente as camadas.
     """
     if project_dir is None:
         project_dir = (
@@ -184,6 +658,28 @@ def load_silver_data(
     bronze_table = load_bronze_table(bronze_path)
     validate_bronze_metadata(bronze_table)
 
+    normalized_batch_ids = normalize_batch_ids(batch_ids)
+
+    requested_incremental = bool(
+        normalized_batch_ids
+    )
+    incremental_supported = (
+        silver_supports_incremental_update(paths)
+    )
+
+    full_rebuild = (
+        not requested_incremental
+        or not incremental_supported
+    )
+
+    if requested_incremental and not incremental_supported:
+        print(
+            "[Lakehouse][Silver][Migration] "
+            "Existing Silver tables are not yet compatible with "
+            "Sprint 7 incremental partitions. Running one full "
+            "rebuild to migrate the schema."
+        )
+
     print(
         "[Lakehouse][Silver] "
         f"Reading consolidated Bronze: {bronze_path}"
@@ -195,6 +691,46 @@ def load_silver_data(
         con.register(
             "bronze",
             bronze_table.to_pyarrow_dataset(),
+        )
+
+        if full_rebuild:
+            affected_event_dates: tuple[str, ...] = ()
+            affected_rejection_dates: tuple[str, ...] = ()
+        else:
+            (
+                affected_event_dates,
+                affected_rejection_dates,
+            ) = discover_affected_partitions(
+                con,
+                normalized_batch_ids,
+            )
+
+            if (
+                not affected_event_dates
+                and not affected_rejection_dates
+            ):
+                print(
+                    "[Lakehouse][Silver][Incremental] "
+                    "No Bronze rows found for the requested batches."
+                )
+
+                return SilverLoadResult(
+                    mode="NOOP",
+                    batch_ids=normalized_batch_ids,
+                    affected_event_dates=(),
+                    affected_rejection_dates=(),
+                    telemetry_rows_written=0,
+                    identity_rows_written=0,
+                    rejected_rows_written=0,
+                )
+
+        create_bronze_scope_view(
+            con,
+            full_rebuild=full_rebuild,
+            affected_event_dates=affected_event_dates,
+            include_unknown_timestamp=(
+                "unknown" in affected_rejection_dates
+            ),
         )
 
         # =========================================================
@@ -421,7 +957,7 @@ def load_silver_data(
                 CAST(ingestion_date AS DATE)
                     AS ingestion_date
 
-            FROM bronze
+            FROM bronze_scope
             """
         )
 
@@ -433,7 +969,7 @@ def load_silver_data(
             "Creating telemetry_events..."
         )
 
-        df_telemetry = con.execute(
+        telemetry_table = con.execute(
             """
             WITH typed_telemetry AS (
                 SELECT
@@ -585,8 +1121,9 @@ def load_silver_data(
             )
 
             SELECT
-                CAST(
-                    event_timestamp AS DATE
+                STRFTIME(
+                    event_timestamp,
+                    '%Y-%m-%d'
                 ) AS event_date,
 
                 typed_telemetry.*,
@@ -621,12 +1158,13 @@ def load_silver_data(
 
             FROM typed_telemetry
             """
-        ).df()
+        ).fetch_arrow_table()
 
-        write_silver_table(
+        telemetry_rows_written = write_silver_table(
             telemetry_path,
-            df_telemetry,
+            telemetry_table,
             partition_by="event_date",
+            full_rebuild=full_rebuild,
         )
 
         # =========================================================
@@ -637,7 +1175,7 @@ def load_silver_data(
             "Creating device_identity_events..."
         )
 
-        df_identity = con.execute(
+        identity_table = con.execute(
             """
             WITH identity_events AS (
                 SELECT
@@ -699,8 +1237,9 @@ def load_silver_data(
             )
 
             SELECT
-                CAST(
-                    event_timestamp AS DATE
+                STRFTIME(
+                    event_timestamp,
+                    '%Y-%m-%d'
                 ) AS event_date,
 
                 identity_events.*,
@@ -746,12 +1285,13 @@ def load_silver_data(
 
             FROM identity_events
             """
-        ).df()
+        ).fetch_arrow_table()
 
-        write_silver_table(
+        identity_rows_written = write_silver_table(
             identity_path,
-            df_identity,
+            identity_table,
             partition_by="event_date",
+            full_rebuild=full_rebuild,
         )
 
         # =========================================================
@@ -762,7 +1302,7 @@ def load_silver_data(
             "Creating rejected_logs..."
         )
 
-        df_rejected = con.execute(
+        rejected_table = con.execute(
             """
             WITH rejected AS (
                 SELECT
@@ -826,32 +1366,74 @@ def load_silver_data(
 
             FROM rejected
             """
-        ).df()
+        ).fetch_arrow_table()
 
-        write_silver_table(
+        rejected_rows_written = write_silver_table(
             rejected_path,
-            df_rejected,
+            rejected_table,
             partition_by="rejection_date",
+            full_rebuild=full_rebuild,
         )
+
+        mode = (
+            "FULL"
+            if full_rebuild
+            else "INCREMENTAL"
+        )
+
+        if full_rebuild:
+            result_event_dates = tuple(
+                sorted(
+                    {
+                        *get_arrow_unique_strings(
+                            telemetry_table,
+                            "event_date",
+                        ),
+                        *get_arrow_unique_strings(
+                            identity_table,
+                            "event_date",
+                        ),
+                    }
+                )
+            )
+            result_rejection_dates = (
+                get_arrow_unique_strings(
+                    rejected_table,
+                    "rejection_date",
+                )
+            )
+        else:
+            result_event_dates = affected_event_dates
+            result_rejection_dates = affected_rejection_dates
 
         print(
             "[Lakehouse][Silver] "
-            "Silver layer complete!"
+            f"Silver layer complete! mode={mode}"
         )
         print(
             "[Lakehouse][Silver] "
             f"Telemetry: {telemetry_path} "
-            f"| rows={len(df_telemetry)}"
+            f"| rows={telemetry_table.num_rows}"
         )
         print(
             "[Lakehouse][Silver] "
             f"Identity: {identity_path} "
-            f"| rows={len(df_identity)}"
+            f"| rows={identity_table.num_rows}"
         )
         print(
             "[Lakehouse][Silver] "
             f"Rejected: {rejected_path} "
-            f"| rows={len(df_rejected)}"
+            f"| rows={rejected_table.num_rows}"
+        )
+
+        return SilverLoadResult(
+            mode=mode,
+            batch_ids=normalized_batch_ids,
+            affected_event_dates=result_event_dates,
+            affected_rejection_dates=result_rejection_dates,
+            telemetry_rows_written=telemetry_rows_written,
+            identity_rows_written=identity_rows_written,
+            rejected_rows_written=rejected_rows_written,
         )
 
     except Exception as error:
