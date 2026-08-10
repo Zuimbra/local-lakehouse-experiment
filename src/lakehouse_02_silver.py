@@ -1,19 +1,46 @@
+from __future__ import annotations
+
 from pathlib import Path
 
 import duckdb
 from deltalake import DeltaTable, write_deltalake
 
 
-def load_silver_data() -> None:
-    project_dir = Path(__file__).resolve().parent.parent
+BRONZE_TABLE_NAME = "tracker_logs"
 
-    # Diretório da Delta Table produzido pela camada Bronze.
+BRONZE_METADATA_COLUMNS = (
+    "source_file",
+    "source_file_hash",
+    "source_row_number",
+    "row_id",
+    "batch_id",
+    "ingested_at",
+    "ingestion_date",
+)
+
+
+def is_delta_table(path: Path) -> bool:
+    """
+    Retorna True quando o caminho representa uma Delta Table local.
+    """
+    return (
+        path.is_dir()
+        and (path / "_delta_log").is_dir()
+    )
+
+
+def get_lakehouse_paths(
+    project_dir: Path,
+) -> dict[str, Path]:
+    """
+    Centraliza os caminhos usados pela camada Silver.
+    """
     bronze_path = (
         project_dir
         / "data"
         / "lakehouse"
         / "01_bronze"
-        / "logs_rastreador_2026-07-01"
+        / BRONZE_TABLE_NAME
     )
 
     silver_path = (
@@ -23,67 +50,170 @@ def load_silver_data() -> None:
         / "02_silver"
     )
 
-    telemetry_path = (
-        silver_path
-        / "telemetry_events"
-    )
+    return {
+        "bronze": bronze_path,
+        "silver": silver_path,
+        "telemetry": silver_path / "telemetry_events",
+        "identity": silver_path / "device_identity_events",
+        "rejected": silver_path / "rejected_logs",
+    }
 
-    identity_path = (
-        silver_path
-        / "device_identity_events"
-    )
 
-    rejected_path = (
-        silver_path
-        / "rejected_logs"
-    )
-
-    silver_path.mkdir(parents=True, exist_ok=True)
-
+def load_bronze_table(
+    bronze_path: Path,
+) -> DeltaTable:
+    """
+    Valida e carrega a Bronze consolidada.
+    """
     if not bronze_path.is_dir():
         raise FileNotFoundError(
-            f"The Bronze Delta Table does not exist: {bronze_path}"
+            "The Bronze Delta Table does not exist: "
+            f"{bronze_path}"
         )
 
-    if not (bronze_path / "_delta_log").is_dir():
+    if not is_delta_table(bronze_path):
         raise ValueError(
-            f"The Bronze path is not a valid Delta Table: {bronze_path}"
+            "The Bronze path is not a valid Delta Table: "
+            f"{bronze_path}"
         )
 
-    print("[Lakehouse] Reading from Bronze Delta Table...")
+    try:
+        return DeltaTable(str(bronze_path))
+
+    except Exception as error:
+        raise RuntimeError(
+            "Could not load the Bronze Delta Table: "
+            f"{bronze_path}. Reason: {error}"
+        ) from error
+
+
+def get_delta_column_names(
+    delta_table: DeltaTable,
+) -> set[str]:
+    """
+    Obtém os nomes das colunas sem depender de conversões de Schema
+    que mudaram entre versões do delta-rs.
+    """
+    return {
+        field.name
+        for field in delta_table.schema().fields
+    }
+
+
+def validate_bronze_metadata(
+    bronze_table: DeltaTable,
+) -> None:
+    """
+    Confirma que a Bronze é compatível com a Sprint 5.
+
+    A Silver não deve voltar silenciosamente a fabricar source_file
+    ou perder informações de linhagem.
+    """
+    available_columns = get_delta_column_names(
+        bronze_table
+    )
+
+    missing_columns = [
+        column
+        for column in BRONZE_METADATA_COLUMNS
+        if column not in available_columns
+    ]
+
+    if missing_columns:
+        raise ValueError(
+            "The Bronze Delta Table is missing ingestion metadata: "
+            + ", ".join(missing_columns)
+        )
+
+
+def write_silver_table(
+    path: Path,
+    dataframe,
+    *,
+    partition_by: str,
+) -> None:
+    """
+    Faz rebuild completo de uma tabela Silver.
+
+    Sprint 6 ainda não é incremental. schema_mode='overwrite' é
+    necessário porque as tabelas Silver antigas não possuíam todos
+    os metadados de linhagem adicionados nesta sprint.
+    """
+    write_deltalake(
+        path,
+        dataframe,
+        mode="overwrite",
+        schema_mode="overwrite",
+        partition_by=[partition_by],
+    )
+
+
+def load_silver_data(
+    project_dir: Path | None = None,
+) -> None:
+    """
+    Reconstrói a Silver inteira a partir da Bronze consolidada.
+
+    Nesta sprint:
+    - Bronze: múltiplos arquivos + ingestão incremental;
+    - Silver: rebuild completo;
+    - Gold: rebuild completo.
+
+    O parâmetro project_dir existe principalmente para facilitar
+    testes automatizados. O pipeline continua chamando a função sem
+    argumentos.
+    """
+    if project_dir is None:
+        project_dir = (
+            Path(__file__).resolve().parent.parent
+        )
+
+    paths = get_lakehouse_paths(project_dir)
+
+    bronze_path = paths["bronze"]
+    silver_path = paths["silver"]
+    telemetry_path = paths["telemetry"]
+    identity_path = paths["identity"]
+    rejected_path = paths["rejected"]
+
+    silver_path.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    bronze_table = load_bronze_table(bronze_path)
+    validate_bronze_metadata(bronze_table)
+
+    print(
+        "[Lakehouse][Silver] "
+        f"Reading consolidated Bronze: {bronze_path}"
+    )
 
     con = duckdb.connect()
 
     try:
-        bronze_table = DeltaTable(str(bronze_path))
         con.register(
             "bronze",
             bronze_table.to_pyarrow_dataset(),
         )
 
-        # A Bronze atual não possui uma coluna source_file.
-        # Preservamos a informação usando o nome lógico da origem.
-        source_file_name = f"{bronze_path.name}.csv"
-        source_file_sql = source_file_name.replace("'", "''")
-
         # =========================================================
         # VIEW COMUM DA BRONZE
         # =========================================================
         #
-        # Esta view realiza apenas normalizações compartilhadas:
-        #
-        # - renomeia as colunas;
-        # - remove espaços;
-        # - converte strings vazias para NULL;
-        # - tenta converter os timestamps;
-        # - mantém os demais campos inicialmente como texto.
+        # Normalizações compartilhadas:
+        # - renomeia colunas do protocolo;
+        # - trim;
+        # - strings vazias -> NULL;
+        # - TRY_CAST de timestamps;
+        # - campos do protocolo permanecem inicialmente como texto;
+        # - metadados da Bronze são preservados sem fabricação.
         #
         # BAT_VOLT, LAT e LONT não são convertidos aqui porque as
-        # mensagens T1 utilizam essas posições para identificadores.
+        # mensagens T1 reutilizam essas posições para identificadores.
         # =========================================================
-
         con.execute(
-            f"""
+            """
             CREATE OR REPLACE TEMP VIEW bronze_normalized AS
 
             SELECT
@@ -270,7 +400,26 @@ def load_silver_data() -> None:
                     ''
                 ) AS temperature_4_raw,
 
-                '{source_file_sql}' AS source_file
+                CAST(source_file AS VARCHAR)
+                    AS source_file,
+
+                CAST(source_file_hash AS VARCHAR)
+                    AS source_file_hash,
+
+                CAST(source_row_number AS BIGINT)
+                    AS source_row_number,
+
+                CAST(row_id AS VARCHAR)
+                    AS row_id,
+
+                CAST(batch_id AS VARCHAR)
+                    AS batch_id,
+
+                CAST(ingested_at AS TIMESTAMP)
+                    AS ingested_at,
+
+                CAST(ingestion_date AS DATE)
+                    AS ingestion_date
 
             FROM bronze
             """
@@ -279,420 +428,436 @@ def load_silver_data() -> None:
         # =========================================================
         # SILVER: TELEMETRY EVENTS
         # =========================================================
-        #
-        # Contém as mensagens válidas de telemetria.
-        #
-        # T1 é excluída porque possui outro schema lógico.
-        # =========================================================
-
-        print("[Lakehouse] Creating telemetry_events...")
+        print(
+            "[Lakehouse][Silver] "
+            "Creating telemetry_events..."
+        )
 
         df_telemetry = con.execute(
-            f"""
-                WITH typed_telemetry AS (
-                    SELECT
-                        server_timestamp,
-                        device_timestamp,
+            """
+            WITH typed_telemetry AS (
+                SELECT
+                    server_timestamp,
+                    device_timestamp,
 
-                        COALESCE(
-                            device_timestamp,
-                            server_timestamp
-                        ) AS event_timestamp,
-
-                        log_type,
-                        message_type,
-
-                        TRY_CAST(
-                            TRY_CAST(
-                                report_type_raw AS DOUBLE
-                            ) AS INTEGER
-                        ) AS report_type,
-
-                        protocol_version,
-
-                        REGEXP_REPLACE(
-                            device_serial_raw,
-                            '^M',
-                            ''
-                        ) AS device_serial,
-
-                        terminal_status,
-
-                        TRY_CAST(
-                            battery_voltage_raw AS DOUBLE
-                        ) AS battery_voltage,
-
-                        location_status_raw
-                            AS location_status,
-
-                        TRY_CAST(
-                            latitude_raw AS DOUBLE
-                        ) AS latitude,
-
-                        TRY_CAST(
-                            longitude_raw AS DOUBLE
-                        ) AS longitude,
-
-                        TRY_CAST(
-                            speed_raw AS DOUBLE
-                        ) AS speed,
-
-                        TRY_CAST(
-                            direction_raw AS DOUBLE
-                        ) AS direction_degrees,
-
-                        TRY_CAST(
-                            internal_battery_raw AS DOUBLE
-                        ) AS internal_battery,
-
-                        TRY_CAST(
-                            odometer_trip_raw AS DOUBLE
-                        ) AS odometer_trip,
-
-                        TRY_CAST(
-                            odometer_total_raw AS DOUBLE
-                        ) AS odometer_total,
-
-                        TRY_CAST(
-                            horimeter_raw AS DOUBLE
-                        ) AS horimeter,
-
-                        TRY_CAST(
-                            hdop_raw AS DOUBLE
-                        ) AS hdop,
-
-                        mcc,
-                        mnc,
-                        lac,
-                        cell_id,
-
-                        TRY_CAST(
-                            rx_level_raw AS DOUBLE
-                        ) AS rx_level,
-
-                        TRY_CAST(
-                            TRY_CAST(
-                                serial_count_raw AS DOUBLE
-                            ) AS BIGINT
-                        ) AS serial_count,
-
-                        transmission_technology,
-                        message_group,
-                        io_status,
-                        driver_id,
-                        passenger_id,
-
-                        TRY_CAST(
-                            rpm_raw AS DOUBLE
-                        ) AS rpm,
-
-                        TRY_CAST(
-                            tachograph_speed_raw AS DOUBLE
-                        ) AS tachograph_speed,
-
-                        TRY_CAST(
-                            tachograph_odometer_raw AS DOUBLE
-                        ) AS tachograph_odometer,
-
-                        TRY_CAST(
-                            temperature_1_raw AS DOUBLE
-                        ) AS temperature_1,
-
-                        TRY_CAST(
-                            temperature_2_raw AS DOUBLE
-                        ) AS temperature_2,
-
-                        TRY_CAST(
-                            temperature_3_raw AS DOUBLE
-                        ) AS temperature_3,
-
-                        TRY_CAST(
-                            temperature_4_raw AS DOUBLE
-                        ) AS temperature_4,
-
-                        source_file
-
-                    FROM bronze_normalized
-
-                    WHERE regexp_full_match(
-                        message_type,
-                        '^T[0-9]+$'
-                    )
-
-                    -- T1 contém dados de identidade.
-                    AND message_type <> 'T1'
-
-                    -- Um evento precisa ter timestamp.
-                    AND COALESCE(
+                    COALESCE(
                         device_timestamp,
                         server_timestamp
-                    ) IS NOT NULL
+                    ) AS event_timestamp,
 
-                    -- Um evento precisa identificar o dispositivo.
-                    AND device_serial_raw IS NOT NULL
+                    log_type,
+                    message_type,
+
+                    TRY_CAST(
+                        TRY_CAST(
+                            report_type_raw AS DOUBLE
+                        ) AS INTEGER
+                    ) AS report_type,
+
+                    protocol_version,
+
+                    REGEXP_REPLACE(
+                        device_serial_raw,
+                        '^M',
+                        ''
+                    ) AS device_serial,
+
+                    terminal_status,
+
+                    TRY_CAST(
+                        battery_voltage_raw AS DOUBLE
+                    ) AS battery_voltage,
+
+                    location_status_raw
+                        AS location_status,
+
+                    TRY_CAST(
+                        latitude_raw AS DOUBLE
+                    ) AS latitude,
+
+                    TRY_CAST(
+                        longitude_raw AS DOUBLE
+                    ) AS longitude,
+
+                    TRY_CAST(
+                        speed_raw AS DOUBLE
+                    ) AS speed,
+
+                    TRY_CAST(
+                        direction_raw AS DOUBLE
+                    ) AS direction_degrees,
+
+                    TRY_CAST(
+                        internal_battery_raw AS DOUBLE
+                    ) AS internal_battery,
+
+                    TRY_CAST(
+                        odometer_trip_raw AS DOUBLE
+                    ) AS odometer_trip,
+
+                    TRY_CAST(
+                        odometer_total_raw AS DOUBLE
+                    ) AS odometer_total,
+
+                    TRY_CAST(
+                        horimeter_raw AS DOUBLE
+                    ) AS horimeter,
+
+                    TRY_CAST(
+                        hdop_raw AS DOUBLE
+                    ) AS hdop,
+
+                    mcc,
+                    mnc,
+                    lac,
+                    cell_id,
+
+                    TRY_CAST(
+                        rx_level_raw AS DOUBLE
+                    ) AS rx_level,
+
+                    TRY_CAST(
+                        TRY_CAST(
+                            serial_count_raw AS DOUBLE
+                        ) AS BIGINT
+                    ) AS serial_count,
+
+                    transmission_technology,
+                    message_group,
+                    io_status,
+                    driver_id,
+                    passenger_id,
+
+                    TRY_CAST(
+                        rpm_raw AS DOUBLE
+                    ) AS rpm,
+
+                    TRY_CAST(
+                        tachograph_speed_raw AS DOUBLE
+                    ) AS tachograph_speed,
+
+                    TRY_CAST(
+                        tachograph_odometer_raw AS DOUBLE
+                    ) AS tachograph_odometer,
+
+                    TRY_CAST(
+                        temperature_1_raw AS DOUBLE
+                    ) AS temperature_1,
+
+                    TRY_CAST(
+                        temperature_2_raw AS DOUBLE
+                    ) AS temperature_2,
+
+                    TRY_CAST(
+                        temperature_3_raw AS DOUBLE
+                    ) AS temperature_3,
+
+                    TRY_CAST(
+                        temperature_4_raw AS DOUBLE
+                    ) AS temperature_4,
+
+                    source_file,
+                    source_file_hash,
+                    source_row_number,
+                    row_id,
+                    batch_id,
+                    ingested_at,
+                    ingestion_date
+
+                FROM bronze_normalized
+
+                WHERE regexp_full_match(
+                    message_type,
+                    '^T[0-9]+$'
                 )
 
-                SELECT
-                    CAST(
-                        event_timestamp AS DATE
-                    ) AS event_date,
+                -- T1 contém dados de identidade.
+                AND message_type <> 'T1'
 
-                    typed_telemetry.*,
+                -- Um evento precisa ter timestamp.
+                AND COALESCE(
+                    device_timestamp,
+                    server_timestamp
+                ) IS NOT NULL
 
-                    CASE
-                        WHEN latitude IS NULL
-                          OR longitude IS NULL
-                        THEN FALSE
+                -- Um evento precisa identificar o dispositivo.
+                AND device_serial_raw IS NOT NULL
+            )
 
-                        WHEN latitude NOT BETWEEN -90 AND 90
-                          OR longitude NOT BETWEEN -180 AND 180
-                        THEN FALSE
+            SELECT
+                CAST(
+                    event_timestamp AS DATE
+                ) AS event_date,
 
-                        ELSE TRUE
-                    END AS has_valid_coordinates,
+                typed_telemetry.*,
 
-                    CASE
-                        WHEN latitude IS NULL
-                          OR longitude IS NULL
-                        THEN 'MISSING_COORDINATES'
+                CASE
+                    WHEN latitude IS NULL
+                      OR longitude IS NULL
+                    THEN FALSE
 
-                        WHEN latitude NOT BETWEEN -90 AND 90
-                          OR longitude NOT BETWEEN -180 AND 180
-                        THEN 'INVALID_COORDINATES'
+                    WHEN latitude NOT BETWEEN -90 AND 90
+                      OR longitude NOT BETWEEN -180 AND 180
+                    THEN FALSE
 
-                        WHEN hdop IS NOT NULL
-                         AND hdop > 5
-                        THEN 'LOW_GPS_PRECISION'
+                    ELSE TRUE
+                END AS has_valid_coordinates,
 
-                        ELSE 'VALID'
-                    END AS position_quality
+                CASE
+                    WHEN latitude IS NULL
+                      OR longitude IS NULL
+                    THEN 'MISSING_COORDINATES'
 
-                FROM typed_telemetry
+                    WHEN latitude NOT BETWEEN -90 AND 90
+                      OR longitude NOT BETWEEN -180 AND 180
+                    THEN 'INVALID_COORDINATES'
+
+                    WHEN hdop IS NOT NULL
+                     AND hdop > 5
+                    THEN 'LOW_GPS_PRECISION'
+
+                    ELSE 'VALID'
+                END AS position_quality
+
+            FROM typed_telemetry
             """
         ).df()
 
-        write_deltalake(
+        write_silver_table(
             telemetry_path,
             df_telemetry,
-            mode="overwrite",
-            partition_by=["event_date"],
+            partition_by="event_date",
         )
 
         # =========================================================
         # SILVER: DEVICE IDENTITY EVENTS
         # =========================================================
-        #
-        # Contém todas as mensagens T1.
-        #
-        # Não agrupamos por dispositivo nesta camada. A Silver
-        # preserva o histórico dos eventos de identidade.
-        # =========================================================
-
-        print("[Lakehouse] Creating device_identity_events...")
+        print(
+            "[Lakehouse][Silver] "
+            "Creating device_identity_events..."
+        )
 
         df_identity = con.execute(
-            f"""
-                WITH identity_events AS (
-                    SELECT
-                        server_timestamp,
-                        device_timestamp,
+            """
+            WITH identity_events AS (
+                SELECT
+                    server_timestamp,
+                    device_timestamp,
 
-                        COALESCE(
-                            device_timestamp,
-                            server_timestamp
-                        ) AS event_timestamp,
-
-                        message_type,
-
-                        TRY_CAST(
-                            TRY_CAST(
-                                report_type_raw AS DOUBLE
-                            ) AS INTEGER
-                        ) AS report_type,
-
-                        protocol_version,
-
-                        device_serial_raw,
-
-                        REGEXP_REPLACE(
-                            device_serial_raw,
-                            '^M',
-                            ''
-                        ) AS device_serial,
-
-                        battery_voltage_raw
-                            AS iccid,
-
-                        location_status_raw
-                            AS identity_auxiliary,
-
-                        latitude_raw
-                            AS imsi,
-
-                        longitude_raw
-                            AS imei,
-
-                        source_file
-
-                    FROM bronze_normalized
-
-                    WHERE message_type = 'T1'
-
-                    AND COALESCE(
+                    COALESCE(
                         device_timestamp,
                         server_timestamp
-                    ) IS NOT NULL
+                    ) AS event_timestamp,
 
-                    AND device_serial_raw IS NOT NULL
-                )
+                    message_type,
 
-                SELECT
-                    CAST(
-                        event_timestamp AS DATE
-                    ) AS event_date,
+                    TRY_CAST(
+                        TRY_CAST(
+                            report_type_raw AS DOUBLE
+                        ) AS INTEGER
+                    ) AS report_type,
 
-                    identity_events.*,
+                    protocol_version,
+                    device_serial_raw,
 
-                    CASE
-                        WHEN iccid IS NULL
-                        THEN FALSE
+                    REGEXP_REPLACE(
+                        device_serial_raw,
+                        '^M',
+                        ''
+                    ) AS device_serial,
 
-                        WHEN regexp_full_match(
-                            iccid,
-                            '^[0-9]{{18,22}}$'
-                        )
-                        THEN TRUE
+                    battery_voltage_raw
+                        AS iccid,
 
-                        ELSE FALSE
-                    END AS has_valid_iccid_format,
+                    location_status_raw
+                        AS identity_auxiliary,
 
-                    CASE
-                        WHEN imsi IS NULL
-                        THEN FALSE
+                    latitude_raw
+                        AS imsi,
 
-                        WHEN regexp_full_match(
-                            imsi,
-                            '^[0-9]{{14,16}}$'
-                        )
-                        THEN TRUE
+                    longitude_raw
+                        AS imei,
 
-                        ELSE FALSE
-                    END AS has_valid_imsi_format,
+                    source_file,
+                    source_file_hash,
+                    source_row_number,
+                    row_id,
+                    batch_id,
+                    ingested_at,
+                    ingestion_date
 
-                    CASE
-                        WHEN imei IS NULL
-                        THEN FALSE
+                FROM bronze_normalized
 
-                        WHEN regexp_full_match(
-                            imei,
-                            '^[0-9]{{15}}$'
-                        )
-                        THEN TRUE
+                WHERE message_type = 'T1'
 
-                        ELSE FALSE
-                    END AS has_valid_imei_format
+                AND COALESCE(
+                    device_timestamp,
+                    server_timestamp
+                ) IS NOT NULL
 
-                FROM identity_events
+                AND device_serial_raw IS NOT NULL
+            )
+
+            SELECT
+                CAST(
+                    event_timestamp AS DATE
+                ) AS event_date,
+
+                identity_events.*,
+
+                CASE
+                    WHEN iccid IS NULL
+                    THEN FALSE
+
+                    WHEN regexp_full_match(
+                        iccid,
+                        '^[0-9]{18,22}$'
+                    )
+                    THEN TRUE
+
+                    ELSE FALSE
+                END AS has_valid_iccid_format,
+
+                CASE
+                    WHEN imsi IS NULL
+                    THEN FALSE
+
+                    WHEN regexp_full_match(
+                        imsi,
+                        '^[0-9]{14,16}$'
+                    )
+                    THEN TRUE
+
+                    ELSE FALSE
+                END AS has_valid_imsi_format,
+
+                CASE
+                    WHEN imei IS NULL
+                    THEN FALSE
+
+                    WHEN regexp_full_match(
+                        imei,
+                        '^[0-9]{15}$'
+                    )
+                    THEN TRUE
+
+                    ELSE FALSE
+                END AS has_valid_imei_format
+
+            FROM identity_events
             """
         ).df()
 
-        write_deltalake(
+        write_silver_table(
             identity_path,
             df_identity,
-            mode="overwrite",
-            partition_by=["event_date"],
+            partition_by="event_date",
         )
 
         # =========================================================
         # SILVER: REJECTED LOGS
         # =========================================================
-        #
-        # Contém linhas que não podem entrar nas tabelas tratadas.
-        # =========================================================
-
-        print("[Lakehouse] Creating rejected_logs...")
+        print(
+            "[Lakehouse][Silver] "
+            "Creating rejected_logs..."
+        )
 
         df_rejected = con.execute(
-            f"""
-                WITH rejected AS (
-                    SELECT
-                        COALESCE(
-                            device_timestamp,
-                            server_timestamp
-                        ) AS event_timestamp,
+            """
+            WITH rejected AS (
+                SELECT
+                    COALESCE(
+                        device_timestamp,
+                        server_timestamp
+                    ) AS event_timestamp,
 
-                        bronze_normalized.*,
+                    bronze_normalized.*,
 
-                        CASE
-                            WHEN message_type IS NULL
-                            THEN 'MISSING_MESSAGE_TYPE'
+                    CASE
+                        WHEN message_type IS NULL
+                        THEN 'MISSING_MESSAGE_TYPE'
 
-                            WHEN NOT regexp_full_match(
-                                message_type,
-                                '^T[0-9]+$'
-                            )
-                            THEN 'INVALID_MESSAGE_TYPE'
-
-                            WHEN COALESCE(
-                                device_timestamp,
-                                server_timestamp
-                            ) IS NULL
-                            THEN 'MISSING_OR_INVALID_TIMESTAMP'
-
-                            WHEN device_serial_raw IS NULL
-                            THEN 'MISSING_DEVICE_SERIAL'
-
-                            ELSE 'UNKNOWN_REJECTION_REASON'
-                        END AS rejection_reason
-
-                    FROM bronze_normalized
-
-                    WHERE
-                        message_type IS NULL
-
-                        OR NOT regexp_full_match(
+                        WHEN NOT regexp_full_match(
                             message_type,
                             '^T[0-9]+$'
                         )
+                        THEN 'INVALID_MESSAGE_TYPE'
 
-                        OR COALESCE(
+                        WHEN COALESCE(
                             device_timestamp,
                             server_timestamp
                         ) IS NULL
+                        THEN 'MISSING_OR_INVALID_TIMESTAMP'
 
-                        OR device_serial_raw IS NULL
-                )
+                        WHEN device_serial_raw IS NULL
+                        THEN 'MISSING_DEVICE_SERIAL'
 
-                SELECT
-                    COALESCE(
-                        STRFTIME(
-                            event_timestamp,
-                            '%Y-%m-%d'
-                        ),
-                        'unknown'
-                    ) AS rejection_date,
+                        ELSE 'UNKNOWN_REJECTION_REASON'
+                    END AS rejection_reason
 
-                    rejected.*
+                FROM bronze_normalized
 
-                FROM rejected
+                WHERE
+                    message_type IS NULL
+
+                    OR NOT regexp_full_match(
+                        message_type,
+                        '^T[0-9]+$'
+                    )
+
+                    OR COALESCE(
+                        device_timestamp,
+                        server_timestamp
+                    ) IS NULL
+
+                    OR device_serial_raw IS NULL
+            )
+
+            SELECT
+                COALESCE(
+                    STRFTIME(
+                        event_timestamp,
+                        '%Y-%m-%d'
+                    ),
+                    'unknown'
+                ) AS rejection_date,
+
+                rejected.*
+
+            FROM rejected
             """
         ).df()
 
-        write_deltalake(
+        write_silver_table(
             rejected_path,
             df_rejected,
-            mode="overwrite",
-            partition_by=["rejection_date"],
+            partition_by="rejection_date",
         )
 
-        print("[Lakehouse] Silver layer complete!")
-        print(f"[Lakehouse] Telemetry: {telemetry_path}")
-        print(f"[Lakehouse] Identity: {identity_path}")
-        print(f"[Lakehouse] Rejected: {rejected_path}")
+        print(
+            "[Lakehouse][Silver] "
+            "Silver layer complete!"
+        )
+        print(
+            "[Lakehouse][Silver] "
+            f"Telemetry: {telemetry_path} "
+            f"| rows={len(df_telemetry)}"
+        )
+        print(
+            "[Lakehouse][Silver] "
+            f"Identity: {identity_path} "
+            f"| rows={len(df_identity)}"
+        )
+        print(
+            "[Lakehouse][Silver] "
+            f"Rejected: {rejected_path} "
+            f"| rows={len(df_rejected)}"
+        )
 
     except Exception as error:
         raise RuntimeError(
-            f"Error while creating Silver Delta Tables: {error}"
+            "Error while creating Silver Delta Tables: "
+            f"{error}"
         ) from error
 
     finally:
