@@ -11,7 +11,8 @@ import pandas as pd
 from pandas.errors import EmptyDataError, ParserError
 
 
-LEGACY_SOURCE_FILE = "logs_rastreador_2026-07-01.csv"
+BRONZE_TABLE_NAME = "tracker_logs"
+BRONZE_PARTITION_COLUMN = "ingestion_date"
 
 METADATA_COLUMNS = (
     "source_file",
@@ -91,6 +92,20 @@ class FileValidationResult:
     reserved_columns: tuple[str, ...] = ()
     error_message: str | None = None
     detected_encoding: str | None = None
+
+
+@dataclass(frozen=True)
+class BronzeWriteResult:
+    """
+    Resultado de uma escrita na Bronze consolidada.
+    """
+
+    bronze_path: Path
+    row_count: int
+    inserted_row_count: int
+    duplicate_row_count: int
+    operation: str
+    metrics: dict[str, object]
 
 
 @dataclass(frozen=True)
@@ -226,6 +241,8 @@ def read_csv_with_supported_encoding(
         dataframe = pd.read_csv(
             file_path,
             encoding="utf-8-sig",
+            dtype=str,
+            keep_default_na=False,
         )
         return dataframe, "utf-8-sig"
 
@@ -233,6 +250,8 @@ def read_csv_with_supported_encoding(
         dataframe = pd.read_csv(
             file_path,
             encoding="latin-1",
+            dtype=str,
+            keep_default_na=False,
         )
         return dataframe, "latin-1"
 
@@ -465,6 +484,64 @@ def move_file_to_quarantine(
     return destination
 
 
+def move_file_to_archive(
+    file_path: Path,
+    archive_path: Path,
+) -> Path:
+    """
+    Move um arquivo concluído para archive sem sobrescrever um arquivo
+    de mesmo nome que já esteja armazenado.
+    """
+    archive_path.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    destination = build_available_destination(
+        destination_directory=archive_path,
+        file_name=file_path.name,
+    )
+
+    shutil.move(
+        str(file_path),
+        str(destination),
+    )
+
+    return destination
+
+
+def try_move_file_to_archive(
+    file_path: Path,
+    archive_path: Path,
+) -> Path | None:
+    """
+    Tenta arquivar um arquivo sem invalidar uma ingestão já commitada.
+
+    Se a escrita Bronze e o SUCCESS já foram persistidos, uma falha de
+    movimentação não transforma o arquivo em FAILED. Na próxima
+    execução ele será reconhecido e uma nova tentativa de arquivamento
+    será feita.
+    """
+    try:
+        archived_file = move_file_to_archive(
+            file_path=file_path,
+            archive_path=archive_path,
+        )
+        print(
+            "[Lakehouse][Bronze][Archive] "
+            f"Movido para: {archived_file}"
+        )
+        return archived_file
+
+    except Exception as error:
+        print(
+            "[Lakehouse][Bronze][Archive][WARNING] "
+            f"Não foi possível mover {file_path.name}: {error}"
+        )
+        return None
+
+
+
 def calculate_file_hash(
     file_path: Path,
     chunk_size: int = FILE_HASH_CHUNK_SIZE,
@@ -537,6 +614,7 @@ def prepare_bronze_dataframe(
     validation_result: FileValidationResult,
     batch_id: str,
     ingested_at: datetime | None = None,
+    source_file_hash: str | None = None,
 ) -> pd.DataFrame:
     """
     Acrescenta os metadados técnicos sem alterar as colunas brutas.
@@ -555,7 +633,10 @@ def prepare_bronze_dataframe(
         raise ValueError("batch_id não pode ser vazio.")
 
     source_path = validation_result.source_path
-    source_file_hash = calculate_file_hash(source_path)
+    source_file_hash = (
+        source_file_hash
+        or calculate_file_hash(source_path)
+    )
     ingestion_timestamp = normalize_ingestion_timestamp(
         ingested_at
     )
@@ -586,73 +667,182 @@ def prepare_bronze_dataframe(
     return bronze_dataframe
 
 
-def write_current_bronze_table(
+def get_bronze_table_path(
+    project_dir: Path,
+) -> Path:
+    """
+    Retorna o caminho único da Bronze consolidada.
+    """
+    return (
+        project_dir
+        / "data"
+        / "lakehouse"
+        / "01_bronze"
+        / BRONZE_TABLE_NAME
+    )
+
+
+def align_dataframe_to_target_schema(
+    dataframe: pd.DataFrame,
+    target_columns: list[str],
+) -> pd.DataFrame:
+    """
+    Garante que a fonte possua todas as colunas já existentes no target.
+
+    Colunas existentes no target, mas ausentes no novo arquivo, recebem
+    NULL. Colunas novas continuam na fonte e podem evoluir o schema
+    através de merge_schema=True.
+    """
+    aligned = dataframe.copy()
+
+    for column in target_columns:
+        if column not in aligned.columns:
+            aligned[column] = None
+
+    new_columns = [
+        column
+        for column in aligned.columns
+        if column not in target_columns
+    ]
+
+    return aligned[
+        [*target_columns, *new_columns]
+    ]
+
+
+def write_bronze_table(
     project_dir: Path,
     validation_result: FileValidationResult,
     batch_id: str,
     ingested_at: datetime | None = None,
-) -> Path:
+    source_file_hash: str | None = None,
+) -> BronzeWriteResult:
     """
-    Preserva a escrita atual de uma única Delta Table, agora com
-    metadados técnicos de ingestão.
+    Escreve um arquivo válido na Bronze consolidada.
 
-    O processamento consolidado dos demais arquivos será implementado
-    nas próximas sprints.
+    Primeira escrita:
+        cria 01_bronze/tracker_logs particionada por ingestion_date.
+
+    Escritas seguintes:
+        executam MERGE insert-only por row_id.
+
+    O predicado usa somente row_id. ingestion_date não participa da
+    identidade porque uma nova tentativa pode ocorrer em outro dia.
+    Assim, uma falha após o commit Delta e antes do SUCCESS da tabela
+    de controle não duplica os registros na reexecução.
     """
     dataframe = prepare_bronze_dataframe(
         validation_result=validation_result,
         batch_id=batch_id,
         ingested_at=ingested_at,
+        source_file_hash=source_file_hash,
     )
 
-    raw_file_path = validation_result.source_path
-
-    bronze_path = (
-        project_dir
-        / "data"
-        / "lakehouse"
-        / "01_bronze"
-        / raw_file_path.stem
-    )
-
+    bronze_path = get_bronze_table_path(project_dir)
     bronze_path.parent.mkdir(
         parents=True,
         exist_ok=True,
     )
 
-    print(
-        "[Lakehouse][Bronze] "
-        f"Gravando Delta Table em: {bronze_path}"
-    )
-
     try:
-        # Import local para manter as funções de descoberta e validação
-        # testáveis mesmo sem inicializar o mecanismo Delta Lake.
-        from deltalake import write_deltalake
+        import pyarrow as pa
+        from deltalake import DeltaTable, write_deltalake
 
-        write_deltalake(
-            bronze_path,
-            dataframe,
-            mode="overwrite",
-            schema_mode="overwrite",
-        )
+        if not is_delta_table(bronze_path):
+            source_table = pa.Table.from_pandas(
+                dataframe,
+                preserve_index=False,
+            )
+
+            write_deltalake(
+                bronze_path,
+                source_table,
+                mode="overwrite",
+                partition_by=[BRONZE_PARTITION_COLUMN],
+            )
+
+            result = BronzeWriteResult(
+                bronze_path=bronze_path,
+                row_count=len(dataframe),
+                inserted_row_count=len(dataframe),
+                duplicate_row_count=0,
+                operation="CREATE",
+                metrics={
+                    "num_source_rows": len(dataframe),
+                    "num_target_rows_inserted": len(dataframe),
+                },
+            )
+
+        else:
+            bronze_table = DeltaTable(str(bronze_path))
+            target_columns = [
+                field.name
+                for field in bronze_table.schema().fields
+            ]
+
+            aligned_dataframe = align_dataframe_to_target_schema(
+                dataframe=dataframe,
+                target_columns=target_columns,
+            )
+
+            source_table = pa.Table.from_pandas(
+                aligned_dataframe,
+                preserve_index=False,
+            )
+
+            metrics = (
+                bronze_table
+                .merge(
+                    source=source_table,
+                    predicate="target.row_id = source.row_id",
+                    source_alias="source",
+                    target_alias="target",
+                    merge_schema=True,
+                )
+                .when_not_matched_insert_all()
+                .execute()
+            )
+
+            inserted_row_count = int(
+                metrics.get(
+                    "num_target_rows_inserted",
+                    0,
+                )
+            )
+            duplicate_row_count = (
+                len(dataframe) - inserted_row_count
+            )
+
+            result = BronzeWriteResult(
+                bronze_path=bronze_path,
+                row_count=len(dataframe),
+                inserted_row_count=inserted_row_count,
+                duplicate_row_count=duplicate_row_count,
+                operation="MERGE",
+                metrics=dict(metrics),
+            )
 
     except Exception as error:
         raise RuntimeError(
-            "O arquivo passou na validação, mas a escrita da "
-            f"Bronze falhou: {raw_file_path.name}: {error}"
+            "Falha ao escrever o arquivo na Bronze consolidada "
+            f"{BRONZE_TABLE_NAME}: "
+            f"{validation_result.source_path.name}: {error}"
         ) from error
 
     print(
         "[Lakehouse][Bronze] "
-        f"Delta Table gravada com sucesso: {bronze_path}"
+        f"{result.operation} concluído em: {bronze_path}"
     )
     print(
         "[Lakehouse][Bronze] "
-        f"Batch: {batch_id} | linhas={len(dataframe)}"
+        f"arquivo={validation_result.source_path.name} "
+        f"| batch={batch_id} "
+        f"| linhas={result.row_count} "
+        f"| inseridas={result.inserted_row_count} "
+        f"| duplicadas={result.duplicate_row_count}"
     )
 
-    return bronze_path
+    return result
 
 
 def get_control_table_path(
@@ -947,63 +1137,98 @@ def load_successful_file_hashes(
     }
 
 
+def load_ingested_file_hashes(
+    bronze_path: Path,
+) -> set[str]:
+    """
+    Carrega hashes realmente presentes na Bronze consolidada.
+    """
+    if not is_delta_table(bronze_path):
+        return set()
+
+    from deltalake import DeltaTable
+
+    bronze_dataframe = DeltaTable(
+        str(bronze_path)
+    ).to_pandas(
+        columns=["source_file_hash"]
+    )
+
+    if bronze_dataframe.empty:
+        return set()
+
+    return {
+        str(file_hash)
+        for file_hash in (
+            bronze_dataframe["source_file_hash"]
+            .dropna()
+            .unique()
+            .tolist()
+        )
+        if str(file_hash).strip()
+    }
+
+
+def load_effective_successful_file_hashes(
+    control_path: Path,
+    bronze_path: Path,
+) -> set[str]:
+    """
+    Considera concluído somente o hash confirmado nos dois lados:
+
+    1. existe SUCCESS na tabela de controle;
+    2. o hash existe em tracker_logs.
+
+    Essa interseção é necessária na migração da Sprint 5 para a 5,
+    porque SUCCESS antigos podem se referir à Bronze legada.
+    """
+    successful_control_hashes = load_successful_file_hashes(
+        control_path
+    )
+    ingested_bronze_hashes = load_ingested_file_hashes(
+        bronze_path
+    )
+
+    return (
+        successful_control_hashes
+        & ingested_bronze_hashes
+    )
+
+
 def should_skip_file_hash(
     source_file_hash: str,
     successful_file_hashes: set[str],
 ) -> bool:
     """
-    Decide se o conteúdo do arquivo já foi concluído com sucesso.
+    Decide se o conteúdo já está confirmado como concluído.
     """
     return source_file_hash in successful_file_hashes
-
-
-def add_legacy_root_file_if_needed(
-    input_files: list[Path],
-    raw_path: Path,
-) -> list[Path]:
-    """
-    Mantém compatibilidade temporária com o arquivo em data/raw/.
-
-    Se houver um arquivo de mesmo nome na inbox, a inbox tem prioridade.
-    """
-    legacy_path = raw_path / LEGACY_SOURCE_FILE
-
-    if not legacy_path.is_file():
-        return input_files
-
-    if any(
-        file_path.name == LEGACY_SOURCE_FILE
-        for file_path in input_files
-    ):
-        return input_files
-
-    print(
-        "[Lakehouse][Bronze][WARNING] "
-        f"O arquivo {LEGACY_SOURCE_FILE} ainda está em data/raw/. "
-        "Mova-o para data/raw/inbox/."
-    )
-
-    return sorted(
-        [*input_files, legacy_path],
-        key=lambda file_path: file_path.name.lower(),
-    )
 
 
 def process_input_files_with_control(
     *,
     project_dir: Path,
     input_files: list[Path],
+    archive_path: Path,
     quarantine_path: Path,
     control_path: Path,
     batch_id: str,
     successful_file_hashes: set[str],
 ) -> list[FileValidationResult]:
     """
-    Controla e processa cada arquivo de forma isolada.
+    Processa todos os CSVs descobertos de forma isolada.
 
-    Nesta sprint, apenas o arquivo legado é escrito na Bronze. Outros
-    arquivos válidos recebem SKIPPED e permanecem na inbox para a futura
-    ativação do processamento múltiplo.
+    Fluxo por arquivo:
+    - calcula hash;
+    - ignora apenas conteúdo confirmado em control + tracker_logs;
+    - registra PROCESSING;
+    - valida;
+    - MERGE insert-only em tracker_logs;
+    - registra SUCCESS;
+    - move para archive.
+
+    Arquivo estruturalmente inválido recebe FAILED e vai para quarantine.
+    Falha de escrita recebe FAILED e permanece na inbox para retry.
     """
     validation_results: list[FileValidationResult] = []
 
@@ -1012,6 +1237,7 @@ def process_input_files_with_control(
 
         try:
             source_file_hash = calculate_file_hash(file_path)
+
         except Exception as error:
             record_ingestion_status(
                 control_path,
@@ -1041,11 +1267,15 @@ def process_input_files_with_control(
                 started_at=started_at,
                 finished_at=datetime.now(timezone.utc),
                 inserted_row_count=0,
-                duplicate_row_count=0,
                 status_reason=(
-                    "O mesmo conteúdo já possui uma ingestão "
-                    "concluída com SUCCESS."
+                    "O conteúdo já possui SUCCESS e também está "
+                    f"presente em {BRONZE_TABLE_NAME}."
                 ),
+            )
+
+            try_move_file_to_archive(
+                file_path=file_path,
+                archive_path=archive_path,
             )
             continue
 
@@ -1105,31 +1335,14 @@ def process_input_files_with_control(
             f"| encoding={validation_result.detected_encoding}"
         )
 
-        if file_path.name != LEGACY_SOURCE_FILE:
-            record_ingestion_status(
-                control_path,
-                batch_id=batch_id,
-                source_file=file_path.name,
-                source_file_hash=source_file_hash,
-                status="SKIPPED",
-                started_at=started_at,
-                finished_at=datetime.now(timezone.utc),
-                row_count=validation_result.row_count,
-                inserted_row_count=0,
-                duplicate_row_count=0,
-                status_reason=(
-                    "Arquivo estruturalmente válido, mas o "
-                    "processamento múltiplo ainda não foi ativado."
-                ),
-            )
-            continue
-
         try:
-            write_current_bronze_table(
+            write_result = write_bronze_table(
                 project_dir=project_dir,
                 validation_result=validation_result,
                 batch_id=batch_id,
+                source_file_hash=source_file_hash,
             )
+
         except Exception as error:
             record_ingestion_status(
                 control_path,
@@ -1144,7 +1357,12 @@ def process_input_files_with_control(
                 duplicate_row_count=0,
                 error_message=str(error),
             )
-            raise
+
+            print(
+                "[Lakehouse][Bronze][ERROR] "
+                f"Falha ao ingerir {file_path.name}: {error}"
+            )
+            continue
 
         record_ingestion_status(
             control_path,
@@ -1154,12 +1372,21 @@ def process_input_files_with_control(
             status="SUCCESS",
             started_at=started_at,
             finished_at=datetime.now(timezone.utc),
-            row_count=validation_result.row_count,
-            inserted_row_count=validation_result.row_count,
-            duplicate_row_count=0,
+            row_count=write_result.row_count,
+            inserted_row_count=write_result.inserted_row_count,
+            duplicate_row_count=write_result.duplicate_row_count,
+            status_reason=(
+                f"Ingestão concluída em {BRONZE_TABLE_NAME} "
+                f"via {write_result.operation}."
+            ),
         )
 
         successful_file_hashes.add(source_file_hash)
+
+        try_move_file_to_archive(
+            file_path=file_path,
+            archive_path=archive_path,
+        )
 
     return validation_results
 
@@ -1186,18 +1413,22 @@ def print_validation_summary(
 
 def load_bronze_data() -> list[FileValidationResult]:
     """
-    Executa a Sprint 4 da Bronze.
+    Executa a Sprint 5 da Bronze.
 
     Responsabilidades:
-    1. descobrir e validar arquivos individualmente;
-    2. manter os metadados de linhagem da Sprint 3;
-    3. registrar PROCESSING, SUCCESS, FAILED e SKIPPED;
-    4. não reprocessar hashes já concluídos com SUCCESS;
-    5. preservar temporariamente a escrita do arquivo legado.
+    1. descobrir todos os CSVs da inbox;
+    2. validar cada arquivo isoladamente;
+    3. manter metadados de linhagem;
+    4. controlar PROCESSING/SUCCESS/FAILED/SKIPPED;
+    5. consolidar todos os arquivos em 01_bronze/tracker_logs;
+    6. usar MERGE insert-only por row_id;
+    7. confirmar skip usando control + tracker_logs;
+    8. mover arquivos concluídos para archive.
     """
     project_dir = Path(__file__).resolve().parent.parent
     batch_id = generate_batch_id()
     control_path = get_control_table_path(project_dir)
+    bronze_path = get_bronze_table_path(project_dir)
 
     print(
         "[Lakehouse][Bronze] "
@@ -1205,7 +1436,7 @@ def load_bronze_data() -> list[FileValidationResult]:
     )
 
     (
-        raw_path,
+        _raw_path,
         inbox_path,
         archive_path,
         quarantine_path,
@@ -1217,11 +1448,15 @@ def load_bronze_data() -> list[FileValidationResult]:
     )
     print(
         "[Lakehouse][Bronze] "
-        f"Archive preparado: {archive_path}"
+        f"Archive: {archive_path}"
     )
     print(
         "[Lakehouse][Bronze] "
         f"Quarantine: {quarantine_path}"
+    )
+    print(
+        "[Lakehouse][Bronze] "
+        f"Tabela consolidada: {bronze_path}"
     )
     print(
         "[Lakehouse][Control] "
@@ -1229,10 +1464,6 @@ def load_bronze_data() -> list[FileValidationResult]:
     )
 
     input_files = discover_input_files(inbox_path)
-    input_files = add_legacy_root_file_if_needed(
-        input_files=input_files,
-        raw_path=raw_path,
-    )
     print_discovered_files(input_files)
 
     if not input_files:
@@ -1242,19 +1473,36 @@ def load_bronze_data() -> list[FileValidationResult]:
         )
         return []
 
-    successful_file_hashes = load_successful_file_hashes(
+    control_success_hashes = load_successful_file_hashes(
         control_path
+    )
+    bronze_hashes = load_ingested_file_hashes(
+        bronze_path
+    )
+    successful_file_hashes = (
+        control_success_hashes
+        & bronze_hashes
     )
 
     print(
         "[Lakehouse][Control] "
-        "Hashes concluídos anteriormente: "
+        f"SUCCESS históricos: {len(control_success_hashes)}"
+    )
+    print(
+        "[Lakehouse][Bronze] "
+        f"Hashes presentes em {BRONZE_TABLE_NAME}: "
+        f"{len(bronze_hashes)}"
+    )
+    print(
+        "[Lakehouse][Bronze] "
+        "Hashes confirmados nos dois lados: "
         f"{len(successful_file_hashes)}"
     )
 
     validation_results = process_input_files_with_control(
         project_dir=project_dir,
         input_files=input_files,
+        archive_path=archive_path,
         quarantine_path=quarantine_path,
         control_path=control_path,
         batch_id=batch_id,

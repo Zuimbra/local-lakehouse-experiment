@@ -15,24 +15,29 @@ if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
 from lakehouse_01_bronze import (  # noqa: E402
+    BRONZE_PARTITION_COLUMN,
+    BRONZE_TABLE_NAME,
     CONTROL_STATUSES,
     EXPECTED_COLUMNS,
-    LEGACY_SOURCE_FILE,
     METADATA_COLUMNS,
-    add_legacy_root_file_if_needed,
+    align_dataframe_to_target_schema,
     append_control_event,
     calculate_file_hash,
     calculate_row_id,
     create_control_event,
     create_raw_directories,
     discover_input_files,
+    get_bronze_table_path,
     get_control_table_path,
+    load_effective_successful_file_hashes,
+    load_ingested_file_hashes,
     load_successful_file_hashes,
+    move_file_to_archive,
     move_file_to_quarantine,
     prepare_bronze_dataframe,
     should_skip_file_hash,
     validate_input_file,
-    write_current_bronze_table,
+    write_bronze_table,
 )
 
 
@@ -50,7 +55,7 @@ def build_valid_dataframe() -> pd.DataFrame:
     )
 
 
-class BronzeSprint4Tests(unittest.TestCase):
+class BronzeSprint5Tests(unittest.TestCase):
     def test_create_raw_directories(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             project_dir = Path(temporary_directory)
@@ -356,7 +361,39 @@ class BronzeSprint4Tests(unittest.TestCase):
                 second_batch.loc[0, "batch_id"],
             )
 
-    def test_write_delta_table_persists_metadata(self) -> None:
+    def test_bronze_table_path(self) -> None:
+        project_dir = Path("project")
+
+        self.assertEqual(
+            get_bronze_table_path(project_dir),
+            (
+                project_dir
+                / "data"
+                / "lakehouse"
+                / "01_bronze"
+                / BRONZE_TABLE_NAME
+            ),
+        )
+
+    def test_align_dataframe_adds_missing_target_columns(self) -> None:
+        dataframe = pd.DataFrame(
+            [{"a": "1", "new_column": "x"}]
+        )
+
+        aligned = align_dataframe_to_target_schema(
+            dataframe,
+            target_columns=["a", "old_column"],
+        )
+
+        self.assertEqual(
+            aligned.columns.tolist(),
+            ["a", "old_column", "new_column"],
+        )
+        self.assertTrue(
+            pd.isna(aligned.loc[0, "old_column"])
+        )
+
+    def test_first_write_creates_consolidated_bronze(self) -> None:
         try:
             from deltalake import DeltaTable
         except ImportError:
@@ -364,30 +401,46 @@ class BronzeSprint4Tests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as temporary_directory:
             project_dir = Path(temporary_directory)
-            source_path = project_dir / "valid.csv"
-            build_valid_dataframe().to_csv(
-                source_path,
-                index=False,
-            )
+            source_path = project_dir / "first.csv"
+
+            dataframe = build_valid_dataframe()
+            dataframe["DATA_SERVIDOR"] = "2026-08-10 10:00:00"
+            dataframe.to_csv(source_path, index=False)
+
             validation_result = validate_input_file(source_path)
 
-            bronze_path = write_current_bronze_table(
+            result = write_bronze_table(
                 project_dir=project_dir,
                 validation_result=validation_result,
-                batch_id="batch-integration-test",
+                batch_id="batch-first",
                 ingested_at=datetime(
                     2026,
-                    7,
-                    30,
-                    17,
-                    30,
+                    8,
+                    10,
+                    12,
+                    0,
                     tzinfo=timezone.utc,
                 ),
             )
 
-            persisted = DeltaTable(
-                str(bronze_path)
-            ).to_pandas()
+            self.assertEqual(
+                result.bronze_path.name,
+                BRONZE_TABLE_NAME,
+            )
+            self.assertEqual(result.operation, "CREATE")
+            self.assertEqual(result.inserted_row_count, 1)
+            self.assertEqual(result.duplicate_row_count, 0)
+
+            delta_table = DeltaTable(
+                str(result.bronze_path)
+            )
+            persisted = delta_table.to_pandas()
+
+            self.assertEqual(len(persisted), 1)
+            self.assertEqual(
+                delta_table.metadata().partition_columns,
+                [BRONZE_PARTITION_COLUMN],
+            )
 
             for metadata_column in METADATA_COLUMNS:
                 self.assertIn(
@@ -395,91 +448,156 @@ class BronzeSprint4Tests(unittest.TestCase):
                     persisted.columns,
                 )
 
-            self.assertEqual(
-                persisted.loc[0, "batch_id"],
-                "batch-integration-test",
-            )
-
-    def test_write_delta_table_migrates_old_schema(self) -> None:
-        """
-        Confirma que uma Bronze antiga, sem metadados, pode ser
-        sobrescrita pela versão da Sprint 3 com o novo schema.
-        """
+    def test_multiple_files_are_consolidated(self) -> None:
         try:
-            from deltalake import DeltaTable, write_deltalake
+            from deltalake import DeltaTable
         except ImportError:
             self.skipTest("deltalake não está instalado.")
 
         with tempfile.TemporaryDirectory() as temporary_directory:
             project_dir = Path(temporary_directory)
-            source_path = project_dir / "valid.csv"
 
-            old_dataframe = build_valid_dataframe()
-            old_dataframe.to_csv(
-                source_path,
-                index=False,
+            first_path = project_dir / "first.csv"
+            second_path = project_dir / "second.csv"
+
+            first = build_valid_dataframe()
+            first["DATA_SERVIDOR"] = "2026-08-10 10:00:00"
+            first.to_csv(first_path, index=False)
+
+            second = build_valid_dataframe()
+            second["DATA_SERVIDOR"] = "2026-08-10 11:00:00"
+            second.to_csv(second_path, index=False)
+
+            first_result = validate_input_file(first_path)
+            second_result = validate_input_file(second_path)
+
+            write_bronze_table(
+                project_dir=project_dir,
+                validation_result=first_result,
+                batch_id="batch-multi",
+            )
+            write_result = write_bronze_table(
+                project_dir=project_dir,
+                validation_result=second_result,
+                batch_id="batch-multi",
             )
 
-            bronze_path = (
-                project_dir
-                / "data"
-                / "lakehouse"
-                / "01_bronze"
-                / source_path.stem
-            )
-            bronze_path.parent.mkdir(
-                parents=True,
-                exist_ok=True,
-            )
-
-            # Simula a Delta Table criada antes da Sprint 3:
-            # contém somente as 37 colunas originais.
-            write_deltalake(
-                bronze_path,
-                old_dataframe,
-                mode="overwrite",
-            )
-
-            old_persisted = DeltaTable(
-                str(bronze_path)
+            persisted = DeltaTable(
+                str(write_result.bronze_path)
             ).to_pandas()
 
+            self.assertEqual(len(persisted), 2)
             self.assertEqual(
-                len(old_persisted.columns),
-                len(EXPECTED_COLUMNS),
+                set(persisted["source_file"].tolist()),
+                {"first.csv", "second.csv"},
             )
+            self.assertEqual(
+                write_result.inserted_row_count,
+                1,
+            )
+
+    def test_merge_is_idempotent_across_batches_and_dates(self) -> None:
+        try:
+            from deltalake import DeltaTable
+        except ImportError:
+            self.skipTest("deltalake não está instalado.")
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            project_dir = Path(temporary_directory)
+            source_path = project_dir / "same.csv"
+
+            dataframe = build_valid_dataframe()
+            dataframe["DATA_SERVIDOR"] = "2026-08-10 10:00:00"
+            dataframe.to_csv(source_path, index=False)
 
             validation_result = validate_input_file(source_path)
 
-            write_current_bronze_table(
+            write_bronze_table(
                 project_dir=project_dir,
                 validation_result=validation_result,
-                batch_id="batch-schema-migration-test",
+                batch_id="batch-one",
                 ingested_at=datetime(
                     2026,
-                    7,
-                    30,
-                    17,
-                    30,
+                    8,
+                    10,
+                    12,
+                    0,
                     tzinfo=timezone.utc,
                 ),
             )
 
-            migrated = DeltaTable(
-                str(bronze_path)
-            ).to_pandas()
-
-            self.assertEqual(
-                len(migrated.columns),
-                len(EXPECTED_COLUMNS) + len(METADATA_COLUMNS),
+            second_result = write_bronze_table(
+                project_dir=project_dir,
+                validation_result=validation_result,
+                batch_id="batch-two",
+                ingested_at=datetime(
+                    2026,
+                    8,
+                    11,
+                    12,
+                    0,
+                    tzinfo=timezone.utc,
+                ),
             )
 
-            for metadata_column in METADATA_COLUMNS:
-                self.assertIn(
-                    metadata_column,
-                    migrated.columns,
-                )
+            persisted = DeltaTable(
+                str(second_result.bronze_path)
+            ).to_pandas()
 
+            self.assertEqual(len(persisted), 1)
+            self.assertEqual(
+                second_result.inserted_row_count,
+                0,
+            )
+            self.assertEqual(
+                second_result.duplicate_row_count,
+                1,
+            )
+            self.assertEqual(
+                persisted.loc[0, "batch_id"],
+                "batch-one",
+            )
+
+    def test_merge_schema_accepts_new_extra_column(self) -> None:
+        try:
+            from deltalake import DeltaTable
+        except ImportError:
+            self.skipTest("deltalake não está instalado.")
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            project_dir = Path(temporary_directory)
+            first_path = project_dir / "first.csv"
+            second_path = project_dir / "second.csv"
+
+            first = build_valid_dataframe()
+            first["DATA_SERVIDOR"] = "first"
+            first.to_csv(first_path, index=False)
+
+            second = build_valid_dataframe()
+            second["DATA_SERVIDOR"] = "second"
+            second["EXTRA_COLUMN"] = "extra"
+            second.to_csv(second_path, index=False)
+
+            write_bronze_table(
+                project_dir=project_dir,
+                validation_result=validate_input_file(first_path),
+                batch_id="batch-extra",
+            )
+            result = write_bronze_table(
+                project_dir=project_dir,
+                validation_result=validate_input_file(second_path),
+                batch_id="batch-extra",
+            )
+
+            persisted = DeltaTable(
+                str(result.bronze_path)
+            ).to_pandas()
+
+            self.assertIn(
+                "EXTRA_COLUMN",
+                persisted.columns,
+            )
+            self.assertEqual(len(persisted), 2)
 
     def test_control_table_path(self) -> None:
         project_dir = Path("project")
@@ -597,40 +715,81 @@ class BronzeSprint4Tests(unittest.TestCase):
             )
         )
 
-    def test_add_legacy_root_file_when_inbox_does_not_have_it(self) -> None:
+    def test_move_file_to_archive(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
-            raw_path = Path(temporary_directory)
-            legacy_path = raw_path / LEGACY_SOURCE_FILE
-            legacy_path.write_text(
-                "column\\nvalue\\n",
+            root = Path(temporary_directory)
+            inbox = root / "inbox"
+            archive = root / "archive"
+            inbox.mkdir()
+
+            source = inbox / "logs.csv"
+            source.write_text(
+                "value\n1\n",
                 encoding="utf-8",
             )
 
-            files = add_legacy_root_file_if_needed(
-                input_files=[],
-                raw_path=raw_path,
+            destination = move_file_to_archive(
+                file_path=source,
+                archive_path=archive,
             )
 
-            self.assertEqual(files, [legacy_path])
+            self.assertFalse(source.exists())
+            self.assertTrue(destination.is_file())
+            self.assertEqual(
+                destination.parent,
+                archive,
+            )
 
-    def test_inbox_legacy_file_has_priority_over_root(self) -> None:
+    def test_effective_success_requires_control_and_bronze(self) -> None:
+        try:
+            import pyarrow  # noqa: F401
+        except ImportError:
+            self.skipTest("pyarrow não está instalado.")
+
         with tempfile.TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory)
-            raw_path = root / "raw"
-            inbox_path = raw_path / "inbox"
-            inbox_path.mkdir(parents=True)
+            control_path = root / "control"
+            bronze_path = root / "missing_bronze"
 
-            root_legacy = raw_path / LEGACY_SOURCE_FILE
-            inbox_legacy = inbox_path / LEGACY_SOURCE_FILE
-            root_legacy.write_text("root", encoding="utf-8")
-            inbox_legacy.write_text("inbox", encoding="utf-8")
-
-            files = add_legacy_root_file_if_needed(
-                input_files=[inbox_legacy],
-                raw_path=raw_path,
+            started_at = datetime(
+                2026,
+                8,
+                10,
+                12,
+                0,
+                tzinfo=timezone.utc,
             )
 
-            self.assertEqual(files, [inbox_legacy])
+            success_event = create_control_event(
+                batch_id="old-batch",
+                source_file="old.csv",
+                source_file_hash="legacy-success-hash",
+                status="SUCCESS",
+                started_at=started_at,
+                row_count=1,
+                inserted_row_count=1,
+                duplicate_row_count=0,
+            )
+            append_control_event(
+                control_path,
+                success_event,
+            )
+
+            self.assertEqual(
+                load_successful_file_hashes(control_path),
+                {"legacy-success-hash"},
+            )
+            self.assertEqual(
+                load_ingested_file_hashes(bronze_path),
+                set(),
+            )
+            self.assertEqual(
+                load_effective_successful_file_hashes(
+                    control_path,
+                    bronze_path,
+                ),
+                set(),
+            )
 
     def test_control_table_appends_history_and_loads_success_hashes(self) -> None:
         try:
