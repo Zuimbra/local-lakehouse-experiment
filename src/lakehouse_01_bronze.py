@@ -109,6 +109,23 @@ class BronzeWriteResult:
 
 
 @dataclass(frozen=True)
+class BronzeLoadResult:
+    """
+    Resultado da execução da camada Bronze.
+
+    batch_ids contém somente batches que efetivamente inseriram
+    pelo menos uma linha nova em tracker_logs.
+    """
+
+    execution_batch_id: str
+    batch_ids: tuple[str, ...]
+    has_new_data: bool
+    inserted_row_count: int
+    source_files: tuple[str, ...]
+    validation_results: tuple[FileValidationResult, ...]
+
+
+@dataclass(frozen=True)
 class IngestionControlEvent:
     """
     Evento imutável do histórico de ingestão de um arquivo.
@@ -1411,9 +1428,54 @@ def print_validation_summary(
     )
 
 
-def load_bronze_data() -> list[FileValidationResult]:
+def summarize_inserted_batch(
+    bronze_path: Path,
+    batch_id: str,
+) -> tuple[int, tuple[str, ...]]:
     """
-    Executa a Sprint 5 da Bronze.
+    Confirma quais linhas deste batch realmente entraram na Bronze.
+
+    Isso é mais confiável do que apenas olhar o evento SUCCESS:
+    um retry pode terminar com SUCCESS mas inserir zero linhas porque
+    o MERGE encontrou todos os row_id já existentes.
+    """
+    if not is_delta_table(bronze_path):
+        return 0, ()
+
+    from deltalake import DeltaTable
+
+    dataframe = DeltaTable(
+        str(bronze_path)
+    ).to_pandas(
+        columns=[
+            "batch_id",
+            "source_file",
+        ],
+        filters=[
+            ("batch_id", "=", batch_id),
+        ],
+    )
+
+    if dataframe.empty:
+        return 0, ()
+
+    source_files = tuple(
+        sorted(
+            {
+                str(value)
+                for value in dataframe[
+                    "source_file"
+                ].dropna().tolist()
+            }
+        )
+    )
+
+    return len(dataframe), source_files
+
+
+def load_bronze_data() -> BronzeLoadResult:
+    """
+    Executa a Bronze consolidada e retorna contexto para o pipeline.
 
     Responsabilidades:
     1. descobrir todos os CSVs da inbox;
@@ -1471,7 +1533,14 @@ def load_bronze_data() -> list[FileValidationResult]:
             "[Lakehouse][Bronze] "
             "Nada para processar nesta execução."
         )
-        return []
+        return BronzeLoadResult(
+            execution_batch_id=batch_id,
+            batch_ids=(),
+            has_new_data=False,
+            inserted_row_count=0,
+            source_files=(),
+            validation_results=(),
+        )
 
     control_success_hashes = load_successful_file_hashes(
         control_path
@@ -1511,7 +1580,39 @@ def load_bronze_data() -> list[FileValidationResult]:
 
     print_validation_summary(validation_results)
 
-    return validation_results
+    (
+        inserted_row_count,
+        inserted_source_files,
+    ) = summarize_inserted_batch(
+        bronze_path=bronze_path,
+        batch_id=batch_id,
+    )
+
+    batch_ids = (
+        (batch_id,)
+        if inserted_row_count > 0
+        else ()
+    )
+
+    result = BronzeLoadResult(
+        execution_batch_id=batch_id,
+        batch_ids=batch_ids,
+        has_new_data=inserted_row_count > 0,
+        inserted_row_count=inserted_row_count,
+        source_files=inserted_source_files,
+        validation_results=tuple(
+            validation_results
+        ),
+    )
+
+    print(
+        "[Lakehouse][Bronze] "
+        f"Resultado | new_data={result.has_new_data} "
+        f"| inserted_rows={result.inserted_row_count} "
+        f"| files={len(result.source_files)}"
+    )
+
+    return result
 
 
 if __name__ == "__main__":
